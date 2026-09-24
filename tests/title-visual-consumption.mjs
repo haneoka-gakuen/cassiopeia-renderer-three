@@ -128,10 +128,7 @@ assert.deepEqual(drawFor("panel.png"), [277, 745, 1366, 192]);
 assert.deepEqual(drawFor("high-score-base.png"), [221, 142, 289, 38]);
 assert.deepEqual(
   drawFor("gekisou-title.png"),
-  [
-    1511.1999993026257, 26.399999529123306, 93.60000139474869,
-    63.20000094175339,
-  ],
+  [1511.1999993026257, 26.399999529123306, 93.60000139474869, 63.20000094175339],
 );
 assert.equal(drawFor("mission-combo.png")?.[2], 93);
 assert.equal(drawFor("mission-luck.png")?.[2], 93);
@@ -146,6 +143,4 @@ layer.draw(state);
 assert.deepEqual(drawFor("active.png"), [277, 730, 1366, 222]);
 
 layer.dispose();
-console.log(
-  "title visual consumption: authored ribbon, normal, and Gekisou sprites passed",
-);
+console.log("title visual consumption: authored ribbon, normal, and Gekisou sprites passed");

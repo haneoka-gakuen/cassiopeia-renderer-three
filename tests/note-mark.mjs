@@ -16,16 +16,7 @@ rendererHarness.disposed = true;
 OurNotesRenderer.prototype.setShowEaseNote.call(rendererHarness, false);
 assert.deepEqual(rendererToggles, [false, true]);
 
-const markedKinds = [
-  "tap",
-  "flick",
-  "flick-left",
-  "flick-right",
-  "slide-start",
-  "slide-node",
-  "trace",
-  "guide",
-];
+const markedKinds = ["tap", "flick", "flick-left", "flick-right", "slide-start", "slide-node", "trace", "guide"];
 for (const kind of markedKinds) {
   assert.deepEqual(resolveEaseNoteMarkPresentation(kind, true, true), {
     hasMark: true,

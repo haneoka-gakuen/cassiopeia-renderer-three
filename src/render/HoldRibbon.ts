@@ -14,9 +14,10 @@ import {
   SRGBColorSpace,
   TextureLoader,
   UnsignedByteType,
+  Vector4,
 } from "three";
 import type { Texture } from "three";
-import { OUR_NOTES_LIVE_GEOMETRY, type OurNotesAssetManifest } from "@haneoka/cassiopeia-plugin-our-notes";
+import { OUR_NOTES_LIVE_GEOMETRY, type OurNotesAssetManifest, type OurNotesSlideLineStyle } from "@haneoka/cassiopeia-plugin-our-notes";
 import type { RenderEasing, RenderHold, RenderPathPoint } from "@haneoka/cassiopeia-plugin-our-notes";
 import { StageProjector } from "./stageGeometry";
 
@@ -106,7 +107,13 @@ function makeTransparentTexture(): DataTexture {
  * Back. The texture is sampled once in its authored UV space; there is no
  * scrolling, repeat, edge pulse or critical recolor in the native shader.
  */
-function makeMaterial(texture: Texture): ShaderMaterial {
+function gradientKeys(gradient: OurNotesSlideLineStyle["normal"]): Vector4[] {
+  const keys = gradient.colors.map(([time, red, green, blue]) => new Vector4(red, green, blue, time));
+  while (keys.length < 4) keys.push(keys[keys.length - 1]!.clone());
+  return keys;
+}
+
+function makeMaterial(texture: Texture, style: OurNotesSlideLineStyle): ShaderMaterial {
   const material = new ShaderMaterial({
     uniforms: {
       uMap: { value: texture },
@@ -116,6 +123,13 @@ function makeMaterial(texture: Texture): ShaderMaterial {
       uZMin: { value: 0 },
       uZMax: { value: 217.60000610351562 },
       uFadeInProgressRange: { value: 0.01 },
+      uNormalKeys: { value: gradientKeys(style.normal) },
+      uPressedKeys: { value: gradientKeys(style.pressed) },
+      uNormalCount: { value: style.normal.colors.length },
+      uPressedCount: { value: style.pressed.colors.length },
+      uNormalAlpha: { value: new Vector4(...style.normal.alpha) },
+      uPressedAlpha: { value: new Vector4(...style.pressed.alpha) },
+      uGuideColor: { value: new Vector4(...style.guide) },
     },
     vertexShader: `
       attribute float aApproach;
@@ -137,37 +151,39 @@ function makeMaterial(texture: Texture): ShaderMaterial {
       uniform float uZMin;
       uniform float uZMax;
       uniform float uFadeInProgressRange;
+      uniform vec4 uNormalKeys[4];
+      uniform vec4 uPressedKeys[4];
+      uniform float uNormalCount;
+      uniform float uPressedCount;
+      uniform vec4 uNormalAlpha;
+      uniform vec4 uPressedAlpha;
+      uniform vec4 uGuideColor;
       varying vec2 vUv;
       varying float vStageZ;
       varying float vApproach;
 
-      vec3 threeKeyGradient(float t, vec3 c0, vec3 c1, vec3 c2) {
-        const float middle = 0.5499961852445259;
-        if (t <= middle) return mix(c0, c1, clamp(t / middle, 0.0, 1.0));
-        return mix(c1, c2, clamp((t - middle) / (1.0 - middle), 0.0, 1.0));
+      vec3 gradientColor(float t, vec4 k0, vec4 k1, vec4 k2, vec4 k3, float count) {
+        if (t <= k1.a) return mix(k0.rgb, k1.rgb, clamp((t - k0.a) / max(0.00001, k1.a - k0.a), 0.0, 1.0));
+        if (count < 3.5 || t <= k2.a)
+          return mix(k1.rgb, k2.rgb, clamp((t - k1.a) / max(0.00001, k2.a - k1.a), 0.0, 1.0));
+        return mix(k2.rgb, k3.rgb, clamp((t - k2.a) / max(0.00001, k3.a - k2.a), 0.0, 1.0));
+      }
+      float gradientAlpha(float t, vec4 keys) {
+        return mix(keys.y, keys.w, clamp((t - keys.x) / max(0.00001, keys.z - keys.x), 0.0, 1.0));
       }
 
       void main() {
         vec4 texel = texture2D(uMap, vUv);
         float zProgress = clamp((vStageZ - uZMin) / max(0.0001, uZMax - uZMin), 0.0, 1.0);
-        vec3 normalRgb = threeKeyGradient(
-          zProgress,
-          vec3(0.4796607196, 0.2862745523, 1.0),
-          vec3(0.2666666508, 0.3255745471, 0.8509804010),
-          vec3(0.3656105399, 0.5172215700, 0.9811320900)
+        vec4 normalColor = vec4(
+          gradientColor(zProgress, uNormalKeys[0], uNormalKeys[1], uNormalKeys[2], uNormalKeys[3], uNormalCount),
+          gradientAlpha(zProgress, uNormalAlpha)
         );
-        vec3 pressedRgb = threeKeyGradient(
-          zProgress,
-          vec3(0.6041513681, 0.3349056840, 1.0),
-          vec3(0.5283370614, 0.4386792183, 1.0),
-          vec3(0.25, 0.6136242151, 1.0)
+        vec4 pressedColor = vec4(
+          gradientColor(zProgress, uPressedKeys[0], uPressedKeys[1], uPressedKeys[2], uPressedKeys[3], uPressedCount),
+          gradientAlpha(zProgress, uPressedAlpha)
         );
-        // Unity Gradient stores color RGB and alpha keys independently in
-        // the same key slots. m_NumAlphaKeys=2, atime=[0,65535], and both
-        // alpha values are 0.8627451062; key2.a is not a third alpha key.
-        vec4 normalColor = vec4(normalRgb, 0.8627451062);
-        vec4 pressedColor = vec4(pressedRgb, 0.8627451062);
-        vec4 guideColor = vec4(0.4705882370, 0.3843137320, 1.0, 0.5098039510);
+        vec4 guideColor = uGuideColor;
         vec4 lineColor = mix(normalColor, pressedColor, uPressed);
         lineColor = mix(lineColor, guideColor, uGuide);
         // CalculateFadeInAlpha leaves progress <= 1 untouched, then fades
@@ -197,7 +213,7 @@ function makeMaterial(texture: Texture): ShaderMaterial {
   return material;
 }
 
-/** Slide/guide ribbon mesh rendered with the original skin001 material. */
+/** Slide/guide ribbon mesh rendered with the selected native gradient. */
 export class HoldRibbonLayer {
   readonly group = new Group();
 
@@ -306,7 +322,7 @@ export class HoldRibbonLayer {
 
   private createVisual(hold: RenderHold): HoldVisual {
     const geometry = new BufferGeometry();
-    const material = makeMaterial(this.slideTexture ?? this.fallbackTexture);
+    const material = makeMaterial(this.slideTexture ?? this.fallbackTexture, this.assets.slideLineStyle);
     const mesh = new Mesh(geometry, material);
     mesh.name = `HoldRibbon:${String(hold.id)}`;
     mesh.frustumCulled = false;

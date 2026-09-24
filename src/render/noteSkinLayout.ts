@@ -1,5 +1,5 @@
 import type { SpriteRegion } from "../assets/SpriteAtlas";
-import type { RenderDirection, RenderNoteKind } from "@haneoka/cassiopeia-plugin-our-notes";
+import type { OurNotesNoteSkin, RenderDirection, RenderNoteKind } from "@haneoka/cassiopeia-plugin-our-notes";
 
 export interface NoteSkinEndpoint {
   spriteName: string;
@@ -135,12 +135,16 @@ export function noteSkinEffectiveDirection(note: Pick<NoteSkinArrowInput, "kind"
   return note.kind === "flick" ? "up" : "none";
 }
 
-export function noteSkinArrowName(note: NoteSkinArrowInput): string | undefined {
+export function noteSkinArrowName(note: NoteSkinArrowInput, skin: OurNotesNoteSkin = "skin001"): string | undefined {
   if (!note.kind.startsWith("flick")) return undefined;
   const direction = noteSkinEffectiveDirection(note);
   if (direction === "up") {
     // LiveFlickNoteView._arrowSpriteEntries branches on width < MaxWidth.
-    const size = note.width < 5 ? "S" : note.width < 12 ? "M" : note.width < 17 ? "L" : "LL";
+    if (skin === "skin003") {
+      const index = DIRECTIONAL_ARROW_THRESHOLDS.findIndex((threshold) => note.width < threshold);
+      return `notes_flick_arrow_upper_${String(index < 0 ? 8 : index + 1).padStart(2, "0")}`;
+    }
+    const size = note.width < 5 ? "S" : note.width < 12 ? "M" : note.width < 18 ? "L" : "LL";
     return `notes_flick_arrow_upper_${size}`;
   }
   if (direction !== "left" && direction !== "right") return undefined;

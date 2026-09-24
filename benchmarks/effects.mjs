@@ -1,8 +1,4 @@
-import {
-  createParticleHarness,
-  createSystem,
-  slideLoopEffect,
-} from "../tests/particle-fixture.mjs";
+import { createParticleHarness, createSystem, slideLoopEffect } from "../tests/particle-fixture.mjs";
 
 const seed = 123;
 const age = 300;

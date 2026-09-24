@@ -383,7 +383,8 @@ export class ScreenLaneBackdrop {
     const texture = this.backgroundTexture;
     if (!texture) return;
     const image = texture.image as
-      { width?: number; height?: number; videoWidth?: number; videoHeight?: number } | undefined;
+      | { width?: number; height?: number; videoWidth?: number; videoHeight?: number }
+      | undefined;
     const imageWidth = Number(image?.videoWidth || image?.width);
     const imageHeight = Number(image?.videoHeight || image?.height);
     if (!(imageWidth > 0) || !(imageHeight > 0)) return;

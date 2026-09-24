@@ -1,17 +1,13 @@
 import assert from "node:assert/strict";
-import { resolveJudgementTimingPresentation, resolveTitleIntroductionLayout, resolveTitleIntroductionRibbonUrl, sampleJudgementPunchScale } from "../dist/index.js";
+import {
+  resolveJudgementTimingPresentation,
+  resolveTitleIntroductionLayout,
+  resolveTitleIntroductionRibbonUrl,
+  sampleJudgementPunchScale,
+} from "../dist/index.js";
 
 const expectedAt60Fps = [
-  1,
-  1.1111111641,
-  1.1777777672,
-  1.2000000477,
-  1.1388889551,
-  1.0888888836,
-  1.0500000715,
-  1.0222222805,
-  1.0055555105,
-  1,
+  1, 1.1111111641, 1.1777777672, 1.2000000477, 1.1388889551, 1.0888888836, 1.0500000715, 1.0222222805, 1.0055555105, 1,
 ];
 
 for (const [frame, expected] of expectedAt60Fps.entries()) {

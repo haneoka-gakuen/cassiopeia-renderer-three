@@ -90,7 +90,7 @@ export function resolveEaseNoteMarkPresentation(
   };
 }
 
-/** Sprite-atlas note renderer backed only by skin001 and native view rules. */
+/** Sprite-atlas note renderer using the selected native note skin. */
 export class NoteLayer {
   readonly group = new Group();
 
@@ -177,7 +177,7 @@ export class NoteLayer {
       return cached;
     }
     const parts = selectNoteSkinParts(note, this.assets.tiltThresholds);
-    const arrowName = noteSkinArrowName(note);
+    const arrowName = noteSkinArrowName(note, this.assets.source?.noteSkin ?? "skin001");
     const decorationName = noteSkinDecorationName(note.kind);
     const descriptor: NoteDescriptor = {
       kind: note.kind,
