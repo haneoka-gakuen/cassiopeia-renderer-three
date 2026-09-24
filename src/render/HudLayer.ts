@@ -221,7 +221,7 @@ export function sampleJudgementPunchScale(age: number): number {
 
 export interface JudgementTimingPresentation {
   readonly mode: "sprite" | "milliseconds";
-  readonly timing: "fast" | "late";
+  readonly timing: "fast" | "late" | "none";
   readonly nativeWidth: number;
   readonly nativeHeight: number;
   readonly fontSize: number;
@@ -241,7 +241,23 @@ export function resolveJudgementTimingPresentation(
   differenceMs: number,
   age: number,
 ): JudgementTimingPresentation | null {
-  if (!fastSlow || age < 0 || age >= JUDGEMENT_SHOW_DURATION) return null;
+  if (age < 0 || age >= JUDGEMENT_SHOW_DURATION) return null;
+  if (!fastSlow) {
+    if (state.showJudgeOffsetMs !== true || !Number.isFinite(differenceMs)) return null;
+    return {
+      mode: "milliseconds",
+      timing: "none",
+      nativeWidth: JUDGEMENT_TIMING_NATIVE_WIDTH,
+      nativeHeight: JUDGEMENT_TIMING_NATIVE_HEIGHT,
+      fontSize: JUDGEMENT_TIMING_FONT_SIZE,
+      text: String(Math.abs(Math.round(differenceMs))),
+      color: "rgba(255, 255, 255, 1)",
+      scale: JUDGEMENT_SUB_SCALE * sampleJudgementPunchScale(age),
+      alpha: 1,
+      localX: 0,
+      localY: 0,
+    };
+  }
   const perfect = judgement === "perfect" || judgement === "just";
   const good = judgement === "good";
   const ordinaryFastSlow = judgement === "bad" || good || judgement === "great";
@@ -1022,7 +1038,7 @@ export class HudLayer {
     context.translate(x, y);
     context.globalAlpha *= timing.alpha;
     context.scale(timing.scale, timing.scale);
-    if (timing.mode === "sprite") {
+    if (timing.mode === "sprite" && timing.timing !== "none") {
       const timingImage = this.judgementImages[timing.timing];
       if (timingImage) {
         context.drawImage(
