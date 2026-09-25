@@ -120,9 +120,17 @@ function makeMaterial(texture: Texture, style: OurNotesSlideLineStyle): ShaderMa
       uOpacity: { value: 1 },
       uPressed: { value: 0 },
       uGuide: { value: 0 },
+      uDisabled: { value: 0 },
       uZMin: { value: 0 },
       uZMax: { value: 217.60000610351562 },
       uFadeInProgressRange: { value: 0.01 },
+      uGlowColor: { value: new Vector4(...style.glow.color) },
+      uGlowIntensity: { value: style.glow.intensity },
+      uGlowFalloff: { value: style.glow.falloff },
+      uGlowWidth: { value: style.glow.width },
+      uGlowDisabledScale: { value: style.glow.disabledScale },
+      uGlowEnabledScale: { value: style.glow.enabledScale },
+      uGlowPressedScale: { value: style.glow.pressedScale },
       uNormalKeys: { value: gradientKeys(style.normal) },
       uPressedKeys: { value: gradientKeys(style.pressed) },
       uNormalCount: { value: style.normal.colors.length },
@@ -151,6 +159,13 @@ function makeMaterial(texture: Texture, style: OurNotesSlideLineStyle): ShaderMa
       uniform float uZMin;
       uniform float uZMax;
       uniform float uFadeInProgressRange;
+      uniform vec4 uGlowColor;
+      uniform float uGlowIntensity;
+      uniform float uGlowFalloff;
+      uniform float uGlowWidth;
+      uniform float uGlowDisabledScale;
+      uniform float uGlowEnabledScale;
+      uniform float uGlowPressedScale;
       uniform vec4 uNormalKeys[4];
       uniform vec4 uPressedKeys[4];
       uniform float uNormalCount;
@@ -194,6 +209,14 @@ function makeMaterial(texture: Texture, style: OurNotesSlideLineStyle): ShaderMa
           1.0
         );
         vec4 outputColor = texel * lineColor;
+        // The compiled Live/Unlit/SlideLine glow block is not
+        // text-extractable; the serialized float names define a symmetric
+        // across-width band whose half-width is GlowWidth scaled by the
+        // enabled/pressed state, dimming with GlowFalloff exponents.
+        float across = abs(vUv.x - 0.5) * 2.0;
+        float glowScale = mix(uGlowEnabledScale, uGlowPressedScale, uPressed);
+        float glow = exp(-uGlowFalloff * across / max(0.0001, uGlowWidth * glowScale));
+        outputColor.rgb += uGlowColor.rgb * (uGlowIntensity * glow * texel.a);
         outputColor.a *= uOpacity * fadeIn;
         if (outputColor.a < 0.001) discard;
         gl_FragColor = outputColor;

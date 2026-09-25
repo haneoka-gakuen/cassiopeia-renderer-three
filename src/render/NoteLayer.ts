@@ -4,10 +4,12 @@ import {
   DoubleSide,
   DynamicDrawUsage,
   Group,
+  Matrix3,
   Mesh,
   MeshBasicMaterial,
   NormalBlending,
   PlaneGeometry,
+  ShaderMaterial,
 } from "three";
 import { SpriteAtlas } from "../assets/SpriteAtlas";
 import { OUR_NOTES_LIVE_GEOMETRY, type OurNotesAssetManifest } from "@haneoka/cassiopeia-plugin-our-notes";
@@ -35,7 +37,9 @@ interface NoteVisual {
   body: Mesh<BufferGeometry, MeshBasicMaterial>;
   bodyPositions: BufferAttribute;
   decoration?: Mesh<PlaneGeometry, MeshBasicMaterial>;
-  arrow?: Mesh<PlaneGeometry, MeshBasicMaterial>;
+  /** skin003 flick arrows use a shader-driven gradient instead of the atlas material. */
+  arrow?: Mesh<PlaneGeometry, MeshBasicMaterial | ShaderMaterial>;
+  arrowGradientMaterial?: ShaderMaterial;
   parts: NoteSkinParts;
   decorationName?: string;
   arrowName?: string;
@@ -127,8 +131,9 @@ export class NoteLayer {
     this.isShowEaseNote = isShowEaseNote;
   }
 
-  update(notes: ReadonlyArray<RenderNote> | undefined): void {
+  update(notes: ReadonlyArray<RenderNote> | undefined, timeSeconds = 0): void {
     const epoch = ++this.updateEpoch;
+    if (this.assets.arrowGradient) this.updateArrowGradient(timeSeconds);
     let drawOrdinal = 0;
     for (const note of notes ?? []) {
       if (note.visible === false) continue;
@@ -146,6 +151,20 @@ export class NoteLayer {
     }
     for (const [id, visual] of this.visuals) {
       if (visual.lastSeen !== epoch) this.releaseVisual(id, visual);
+    }
+  }
+
+  /** Advance the skin003 arrow gradient sweep; every arrow shares one clock. */
+  private updateArrowGradient(timeSeconds: number): void {
+    const gradient = this.assets.arrowGradient!;
+    const cycle = Math.max(1e-4, gradient.durationSeconds + gradient.pauseSeconds);
+    const phase = ((timeSeconds % cycle) + cycle) % cycle;
+    const progress = Math.min(1, phase / Math.max(1e-4, gradient.durationSeconds));
+    for (const visual of this.visuals.values()) {
+      const material = visual.arrowGradientMaterial;
+      if (!material) continue;
+      const width = material.uniforms.uBandWidth!.value as number;
+      material.uniforms.uGradientOffset!.value = -width + (1 + 2 * width) * progress;
     }
   }
 
@@ -275,9 +294,12 @@ export class NoteLayer {
     }
 
     let arrow: NoteVisual["arrow"];
+    let arrowGradientMaterial: NoteVisual["arrowGradientMaterial"];
     if (arrowName) {
-      const material = this.material(arrowName);
-      materials.push(material);
+      arrowGradientMaterial = this.arrowGradientMaterial(arrowName);
+      const material: MeshBasicMaterial | ShaderMaterial =
+        arrowGradientMaterial ?? this.material(arrowName);
+      if (!arrowGradientMaterial) materials.push(material as MeshBasicMaterial);
       arrow = new Mesh(this.plane, material);
       arrow.name = "flick-arrow";
       arrow.renderOrder = OUR_NOTES_LIVE_GEOMETRY.sortingOrders.noteArrow;
@@ -292,6 +314,7 @@ export class NoteLayer {
       bodyPositions,
       decoration,
       arrow,
+      arrowGradientMaterial,
       parts,
       decorationName,
       arrowName,
@@ -383,6 +406,68 @@ export class NoteLayer {
     positions[offset + 9] = centerX - halfX;
     positions[offset + 10] = centerY + halfY;
     positions[offset + 11] = 0;
+  }
+
+  /**
+   * skin003 ArrowGradientSettings: the Sirius/ArrowGradientCenter shader
+   * sweeps a brightness band along each flick arrow. The compiled shader is
+   * not text-extractable, so this recreates the sweep from the serialized
+   * settings — a MinAlpha floor with a band travelling base→tip every
+   * duration; left/right arrows use the wider directional band width.
+   */
+  private arrowGradientMaterial(spriteName: string): ShaderMaterial | undefined {
+    const gradient = this.assets.arrowGradient;
+    const directional = spriteName.includes("_left_") || spriteName.includes("_right_");
+    if (!gradient || !spriteName.startsWith("notes_flick_arrow_")) return undefined;
+    const settings = directional ? gradient.directional : gradient.center;
+    const transform = this.atlas?.regionUvTransform(spriteName);
+    const map = this.atlas?.createTexture(spriteName);
+    if (!transform || !map) return undefined;
+    const material = new ShaderMaterial({
+      uniforms: {
+        uMap: { value: map },
+        uUvTransform: {
+          value: new Matrix3().set(
+            transform.a, transform.b, transform.e,
+            transform.c, transform.d, transform.f,
+            0, 0, 1,
+          ),
+        },
+        uGradientOffset: { value: 1 },
+        uBandWidth: { value: settings.bandWidth },
+        uMinAlpha: { value: settings.minAlpha },
+        uOpacity: { value: 1 },
+      },
+      vertexShader: `
+        varying vec2 vUv;
+        void main() {
+          vUv = uv;
+          gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+        }
+      `,
+      fragmentShader: `
+        uniform sampler2D uMap;
+        uniform mat3 uUvTransform;
+        uniform float uGradientOffset;
+        uniform float uBandWidth;
+        uniform float uMinAlpha;
+        uniform float uOpacity;
+        varying vec2 vUv;
+        void main() {
+          vec2 atlasUv = (uUvTransform * vec3(vUv, 1.0)).xy;
+          vec4 texel = texture2D(uMap, atlasUv);
+          float band = 1.0 - smoothstep(0.0, uBandWidth * 0.5, abs(vUv.y - uGradientOffset));
+          float alpha = max(uMinAlpha, band);
+          gl_FragColor = vec4(texel.rgb, texel.a * alpha * uOpacity);
+        }
+      `,
+      transparent: true,
+      depthWrite: false,
+      side: DoubleSide,
+      toneMapped: false,
+    });
+    material.forceSinglePass = true;
+    return material;
   }
 
   private material(spriteName: string): MeshBasicMaterial {
@@ -490,6 +575,7 @@ export class NoteLayer {
     const alpha = Math.max(0, Math.min(1, note.alpha ?? 1));
     if (visual.lastAlpha !== alpha) {
       for (const material of visual.materials) material.opacity = alpha;
+      if (visual.arrowGradientMaterial) visual.arrowGradientMaterial.uniforms.uOpacity!.value = alpha;
       visual.lastAlpha = alpha;
     }
     // LiveNoteViewBase.UpdateView multiplies every component of Vector3.one by
@@ -517,6 +603,7 @@ export class NoteLayer {
       if (material.map && this.atlas) this.atlas.releaseMaterial(material);
       else material.dispose();
     }
+    if (visual.arrowGradientMaterial) visual.arrowGradientMaterial.dispose();
   }
 
   private destroyVisuals(): void {

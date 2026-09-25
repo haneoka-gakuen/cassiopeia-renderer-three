@@ -252,7 +252,7 @@ export class OurNotesRenderer {
     this.screenLane?.setBackgroundBrightness(frame.stage?.backgroundBrightness ?? 0.7);
     this.holds.update(frame.holds, frame.time);
     this.simultaneousLines.update(frame.simultaneousLines);
-    this.notes.update(frame.notes);
+    this.notes.update(frame.notes, frame.time);
     this.particles.updateLaneInput(frame.particles);
     this.renderer.clear(true, true, true);
     if (this.screenLane) {

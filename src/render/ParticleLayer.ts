@@ -250,6 +250,9 @@ export const MOBILE_ADD_HDR_TINT_LONG_STAR = [
 export const MOBILE_ADD_HDR_TINT_CENTER_PILLAR = [
   1.4980392456054688, 1.4980392456054688, 1.4980392456054688, 0.4901960790157318,
 ] as const;
+// note_point_simple.mat: effect001Simple point emitters use a dimmer HDR tint
+// than the star materials; MobileAddHdrColor still applies it twice.
+export const MOBILE_ADD_HDR_TINT_CIRCLE_ICON = [1.1509433985, 1.1509433985, 1.1509433985, 1] as const;
 export const MOBILE_ADD_HDR_TINT_STRONG = [
   4.237094402313232, 4.237094402313232, 4.237094402313232, 0.5490196347236633,
 ] as const;
@@ -2340,8 +2343,20 @@ export class ParticleLayer {
         this.fallbackTexture,
         MOBILE_ADD_HDR_TINT_CENTER_PILLAR,
       ),
+      circleIcon: new ParticleQuadBatch(
+        "circleIcon",
+        this.capacity,
+        this.fallbackTexture,
+        MOBILE_ADD_HDR_TINT_CIRCLE_ICON,
+      ),
     };
-    this.batchList = [this.batches.star, this.batches.longStar, this.batches.centerPillar, this.batches.centerPillar02];
+    this.batchList = [
+      this.batches.star,
+      this.batches.longStar,
+      this.batches.centerPillar,
+      this.batches.centerPillar02,
+      this.batches.circleIcon,
+    ];
     this.frameBatch = new EffectMeshBatch(
       "frame",
       this.slicedSpriteGeometry,
@@ -2413,6 +2428,7 @@ export class ParticleLayer {
       ["wall", this.assets.particles.wallTextureUrl],
       ["centerPillar", this.assets.particles.centerPillarTextureUrl],
       ["centerPillar02", this.assets.particles.centerPillar02TextureUrl],
+      ["circleIcon", this.assets.particles.circleIconTextureUrl],
       ["laneEffect", this.assets.particles.laneEffects.inVain.textureUrl],
     ];
     const textureResults = await Promise.allSettled(
@@ -2517,7 +2533,13 @@ export class ParticleLayer {
       const [key, texture] = result.value;
       this.textures.get(key)?.dispose();
       this.textures.set(key, texture);
-      if (key === "star" || key === "longStar" || key === "centerPillar" || key === "centerPillar02")
+      if (
+        key === "star" ||
+        key === "longStar" ||
+        key === "centerPillar" ||
+        key === "centerPillar02" ||
+        key === "circleIcon"
+      )
         this.batches[key].setTexture(texture);
       if (key === "line") this.frameBatch.setTexture(texture);
       if (key === "pillar") this.pillarBatch.setTexture(texture);
