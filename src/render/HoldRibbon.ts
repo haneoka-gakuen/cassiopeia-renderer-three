@@ -1,9 +1,9 @@
 import {
+  BackSide,
   BufferAttribute,
   BufferGeometry,
   ClampToEdgeWrapping,
   DataTexture,
-  DoubleSide,
   DynamicDrawUsage,
   Group,
   LinearFilter,
@@ -17,9 +17,33 @@ import {
   Vector4,
 } from "three";
 import type { Texture } from "three";
-import { OUR_NOTES_LIVE_GEOMETRY, type OurNotesAssetManifest, type OurNotesSlideLineStyle } from "@haneoka/cassiopeia-plugin-our-notes";
+import {
+  OUR_NOTES_LIVE_GEOMETRY,
+  type OurNotesAssetManifest,
+  type OurNotesSlideLineGradient,
+  type OurNotesSlideLineStyle,
+} from "@haneoka/cassiopeia-plugin-our-notes";
 import type { RenderEasing, RenderHold, RenderPathPoint } from "@haneoka/cassiopeia-plugin-our-notes";
 import { StageProjector } from "./stageGeometry";
+
+type NativeRenderPathPoint = RenderPathPoint & { lineProgress?: number };
+type NativeRenderHold = Omit<RenderHold, "points"> & {
+  points: ReadonlyArray<NativeRenderPathPoint>;
+  missed?: boolean;
+  minimumWidth?: number;
+};
+
+type NativeSlideLineStyle = OurNotesSlideLineStyle & {
+  disabled?: OurNotesSlideLineGradient;
+  widthScale?: number;
+  glowRangeScale?: number;
+};
+
+interface ResolvedSlideLineStyle extends OurNotesSlideLineStyle {
+  readonly disabled: OurNotesSlideLineGradient;
+  readonly widthScale: number;
+  readonly glowRangeScale: number;
+}
 
 interface HoldVisual {
   mesh: Mesh<BufferGeometry, ShaderMaterial>;
@@ -27,29 +51,47 @@ interface HoldVisual {
   material: ShaderMaterial;
   capacity: number;
   positions: Float32Array;
-  uvs: Float32Array;
-  approaches: Float32Array;
+  colors: Float32Array;
+  localBounds: Float32Array;
+  texCoords: Float32Array;
+  guideUvs: Float32Array;
   positionAttribute?: BufferAttribute;
-  approachAttribute?: BufferAttribute;
+  colorAttribute?: BufferAttribute;
+  localBoundsAttribute?: BufferAttribute;
+  texCoordAttribute?: BufferAttribute;
   positionUpdateRange: { start: number; count: number };
-  approachUpdateRange: { start: number; count: number };
+  colorUpdateRange: { start: number; count: number };
+  localBoundsUpdateRange: { start: number; count: number };
+  texCoordUpdateRange: { start: number; count: number };
   lastSeen: number;
-  lastOpacity: number;
-  lastPressed: number;
+  lastState: number;
   lastGuide: number;
+}
+
+interface GradientTextureResult {
+  texture: DataTexture;
+  normalMaxAlpha: number;
 }
 
 const EMPTY_FLOATS = new Float32Array(0);
 const clamp01 = (value: number): number => Math.max(0, Math.min(1, value));
+const f32 = Math.fround;
 // LiveNoteLineViewBase._offsetValue from class init. One mesh unit is three
 // trapezia / eight vertices, with the two cap strips occupying the authored
 // 0..1/8 and 7/8..1 texture ranges.
 const RIBBON_U = [0, 0.125, 0.875, 1] as const;
 const RIBBON_COLUMNS = RIBBON_U.length;
-// SetStatusValue selects the slide texture row at 1/2. The compiled
-// Live/Unlit/SlideLine fragment shader treats this as a sprite-sheet row; it
-// is not longitudinal path progress.
-const NORMAL_FRAGMENT_V = 0.5;
+// Native type-10 slide lines use a time-derived m and V=.833333373. The
+// selected main material's evidenced default MainTex is white, so m has no
+// visible effect until a caller explicitly supplies a custom MainTex. The DTO
+// does not carry the native begin-time binding, so retain the existing safe
+// fixed blend while keeping the native row V.
+const MAIN_TEX_ROW_BLEND = 0.5;
+const MAIN_TEX_ROW_V = 0.833333373;
+const NATIVE_EPSILON = 1e-5;
+const NATIVE_FADE_RANGE = 0.01;
+const NATIVE_Z_MIN = 0;
+const NATIVE_Z_MAX = 217.60000610351562;
 
 function easing(value: number, mode: RenderEasing | undefined): number {
   const t = clamp01(value);
@@ -93,37 +135,105 @@ function sampleCount(points: ReadonlyArray<RenderPathPoint>): number {
   return count;
 }
 
-function makeTransparentTexture(): DataTexture {
-  // A missing native slide_line texture must fail closed. A white strip is
-  // not visually equivalent to the original material.
-  const texture = new DataTexture(new Uint8Array([0, 0, 0, 0]), 1, 1, RGBAFormat, UnsignedByteType);
+function makeFallbackTexture(hasAuthoredTexture: boolean): DataTexture {
+  // An unbound native _MainTex uses the shader's white default. An explicit
+  // custom texture stays transparent until its resource has loaded.
+  const rgba = hasAuthoredTexture ? [0, 0, 0, 0] : [255, 255, 255, 255];
+  const texture = new DataTexture(new Uint8Array(rgba), 1, 1, RGBAFormat, UnsignedByteType);
+  texture.wrapS = ClampToEdgeWrapping;
+  texture.wrapT = ClampToEdgeWrapping;
+  texture.minFilter = LinearFilter;
+  texture.magFilter = LinearFilter;
+  texture.generateMipmaps = false;
   texture.needsUpdate = true;
   return texture;
 }
 
-/**
- * Live/Unlit/SlideLine from the decoded skin001 shader/material:
- * Transparent queue, SrcAlpha/OneMinusSrcAlpha, ZWrite Off, LEqual and Cull
- * Back. The texture is sampled once in its authored UV space; there is no
- * scrolling, repeat, edge pulse or critical recolor in the native shader.
- */
-function gradientKeys(gradient: OurNotesSlideLineStyle["normal"]): Vector4[] {
-  const keys = gradient.colors.map(([time, red, green, blue]) => new Vector4(red, green, blue, time));
-  while (keys.length < 4) keys.push(keys[keys.length - 1]!.clone());
-  return keys;
+function resolveStyle(style: OurNotesSlideLineStyle, noteSkin: OurNotesAssetManifest["source"]["noteSkin"]): ResolvedSlideLineStyle {
+  const native = style as NativeSlideLineStyle;
+  return {
+    ...style,
+    // The root-owned DTO/style change supplies this field. Falling back to
+    // normal keeps an older manifest drawable without changing the new path.
+    disabled: native.disabled ?? style.normal,
+    widthScale: native.widthScale ?? 0.9,
+    glowRangeScale: native.glowRangeScale ?? (noteSkin === "skin002" ? 2 : 2.5),
+  };
 }
 
-function makeMaterial(texture: Texture, style: OurNotesSlideLineStyle): ShaderMaterial {
+function sampleGradientColor(gradient: OurNotesSlideLineGradient, time: number): [number, number, number] {
+  const keys = gradient.colors;
+  if (keys.length === 0) return [1, 1, 1];
+  if (time <= keys[0]![0]) return [keys[0]![1], keys[0]![2], keys[0]![3]];
+  for (let index = 1; index < keys.length; index += 1) {
+    const previous = keys[index - 1]!;
+    const current = keys[index]!;
+    if (time <= current[0]) {
+      const amount = clamp01((time - previous[0]) / Math.max(NATIVE_EPSILON, current[0] - previous[0]));
+      return [
+        previous[1] + (current[1] - previous[1]) * amount,
+        previous[2] + (current[2] - previous[2]) * amount,
+        previous[3] + (current[3] - previous[3]) * amount,
+      ];
+    }
+  }
+  const last = keys[keys.length - 1]!;
+  return [last[1], last[2], last[3]];
+}
+
+function sampleGradientAlpha(gradient: OurNotesSlideLineGradient, time: number): number {
+  const [startTime, startAlpha, endTime, endAlpha] = gradient.alpha;
+  const amount = clamp01((time - startTime) / Math.max(NATIVE_EPSILON, endTime - startTime));
+  return startAlpha + (endAlpha - startAlpha) * amount;
+}
+
+function toTextureByte(value: number): number {
+  return Math.round(clamp01(value) * 255);
+}
+
+function makeGradientTexture(style: ResolvedSlideLineStyle): GradientTextureResult {
+  const rows = [style.disabled, style.normal, style.pressed] as const;
+  const data = new Uint8Array(256 * 3 * 4);
+  let normalMaxAlpha = 0;
+  for (let row = 0; row < rows.length; row += 1) {
+    const gradient = rows[row]!;
+    for (let index = 0; index < 256; index += 1) {
+      const time = index / 255;
+      const color = sampleGradientColor(gradient, time);
+      const alpha = sampleGradientAlpha(gradient, time);
+      if (row === 1) normalMaxAlpha = Math.max(normalMaxAlpha, alpha);
+      const offset = (row * 256 + index) * 4;
+      data[offset] = toTextureByte(color[0]);
+      data[offset + 1] = toTextureByte(color[1]);
+      data[offset + 2] = toTextureByte(color[2]);
+      data[offset + 3] = toTextureByte(alpha);
+    }
+  }
+  const texture = new DataTexture(data, 256, 3, RGBAFormat, UnsignedByteType);
+  texture.minFilter = LinearFilter;
+  texture.magFilter = LinearFilter;
+  texture.wrapS = ClampToEdgeWrapping;
+  texture.wrapT = ClampToEdgeWrapping;
+  texture.generateMipmaps = false;
+  texture.needsUpdate = true;
+  return { texture, normalMaxAlpha };
+}
+
+function makeMaterial(
+  mainTexture: Texture,
+  gradientTexture: Texture,
+  normalAlphaScale: number,
+  style: ResolvedSlideLineStyle,
+): ShaderMaterial {
   const material = new ShaderMaterial({
     uniforms: {
-      uMap: { value: texture },
-      uOpacity: { value: 1 },
-      uPressed: { value: 0 },
+      uMap: { value: mainTexture },
+      uGradientTex: { value: gradientTexture },
+      uColor: { value: new Vector4(1, 1, 1, normalAlphaScale) },
+      uGradientState: { value: 1 },
       uGuide: { value: 0 },
-      uDisabled: { value: 0 },
-      uZMin: { value: 0 },
-      uZMax: { value: 217.60000610351562 },
-      uFadeInProgressRange: { value: 0.01 },
+      uZMin: { value: NATIVE_Z_MIN },
+      uZMax: { value: NATIVE_Z_MAX },
       uGlowColor: { value: new Vector4(...style.glow.color) },
       uGlowIntensity: { value: style.glow.intensity },
       uGlowFalloff: { value: style.glow.falloff },
@@ -131,34 +241,33 @@ function makeMaterial(texture: Texture, style: OurNotesSlideLineStyle): ShaderMa
       uGlowDisabledScale: { value: style.glow.disabledScale },
       uGlowEnabledScale: { value: style.glow.enabledScale },
       uGlowPressedScale: { value: style.glow.pressedScale },
-      uNormalKeys: { value: gradientKeys(style.normal) },
-      uPressedKeys: { value: gradientKeys(style.pressed) },
-      uNormalCount: { value: style.normal.colors.length },
-      uPressedCount: { value: style.pressed.colors.length },
-      uNormalAlpha: { value: new Vector4(...style.normal.alpha) },
-      uPressedAlpha: { value: new Vector4(...style.pressed.alpha) },
       uGuideColor: { value: new Vector4(...style.guide) },
     },
     vertexShader: `
-      attribute float aApproach;
+      attribute vec2 aLocalBounds;
+      attribute vec4 aTexCoord;
       varying vec2 vUv;
-      varying float vStageZ;
-      varying float vApproach;
+      varying vec3 vLocalPosition;
+      varying vec4 vColor;
+      varying vec2 vLocalBounds;
+      varying vec4 vTexCoord;
       void main() {
         vUv = uv;
-        vStageZ = position.z;
-        vApproach = aApproach;
+        vLocalPosition = position;
+        vColor = color;
+        vLocalBounds = aLocalBounds;
+        vTexCoord = aTexCoord;
         gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
       }
     `,
     fragmentShader: `
       uniform sampler2D uMap;
-      uniform float uOpacity;
-      uniform float uPressed;
+      uniform sampler2D uGradientTex;
+      uniform vec4 uColor;
+      uniform float uGradientState;
       uniform float uGuide;
       uniform float uZMin;
       uniform float uZMax;
-      uniform float uFadeInProgressRange;
       uniform vec4 uGlowColor;
       uniform float uGlowIntensity;
       uniform float uGlowFalloff;
@@ -166,73 +275,93 @@ function makeMaterial(texture: Texture, style: OurNotesSlideLineStyle): ShaderMa
       uniform float uGlowDisabledScale;
       uniform float uGlowEnabledScale;
       uniform float uGlowPressedScale;
-      uniform vec4 uNormalKeys[4];
-      uniform vec4 uPressedKeys[4];
-      uniform float uNormalCount;
-      uniform float uPressedCount;
-      uniform vec4 uNormalAlpha;
-      uniform vec4 uPressedAlpha;
       uniform vec4 uGuideColor;
       varying vec2 vUv;
-      varying float vStageZ;
-      varying float vApproach;
+      varying vec3 vLocalPosition;
+      varying vec4 vColor;
+      varying vec2 vLocalBounds;
+      varying vec4 vTexCoord;
 
-      vec3 gradientColor(float t, vec4 k0, vec4 k1, vec4 k2, vec4 k3, float count) {
-        if (t <= k1.a) return mix(k0.rgb, k1.rgb, clamp((t - k0.a) / max(0.00001, k1.a - k0.a), 0.0, 1.0));
-        if (count < 3.5 || t <= k2.a)
-          return mix(k1.rgb, k2.rgb, clamp((t - k1.a) / max(0.00001, k2.a - k1.a), 0.0, 1.0));
-        return mix(k2.rgb, k3.rgb, clamp((t - k2.a) / max(0.00001, k3.a - k2.a), 0.0, 1.0));
+      float saturate(float value) {
+        return clamp(value, 0.0, 1.0);
       }
-      float gradientAlpha(float t, vec4 keys) {
-        return mix(keys.y, keys.w, clamp((t - keys.x) / max(0.00001, keys.z - keys.x), 0.0, 1.0));
+
+      vec3 rgbToHsv(vec3 value) {
+        const float epsilon = 1.0e-10;
+        vec4 k = vec4(0.0, -0.3333333333, 0.6666666667, -1.0);
+        vec4 p = mix(vec4(value.bg, k.wz), vec4(value.gb, k.xy), step(value.b, value.g));
+        vec4 q = mix(vec4(p.xyw, value.r), vec4(value.r, p.yzx), step(p.x, value.r));
+        float chroma = q.x - min(q.w, q.y);
+        float hue = abs(q.z + (q.w - q.y) / (6.0 * chroma + epsilon));
+        float saturation = chroma / (q.x + epsilon);
+        return vec3(hue, saturation, q.x);
+      }
+
+      vec3 hsvToRgb(vec3 value) {
+        vec3 profile = abs(fract(value.xxx + vec3(1.0, 0.6666666667, 0.3333333333)) * 6.0 - 3.0);
+        profile = clamp(profile - 1.0, 0.0, 1.0);
+        return value.z * mix(vec3(1.0), profile, value.y);
       }
 
       void main() {
-        vec4 texel = texture2D(uMap, vUv);
-        float zProgress = clamp((vStageZ - uZMin) / max(0.0001, uZMax - uZMin), 0.0, 1.0);
-        vec4 normalColor = vec4(
-          gradientColor(zProgress, uNormalKeys[0], uNormalKeys[1], uNormalKeys[2], uNormalKeys[3], uNormalCount),
-          gradientAlpha(zProgress, uNormalAlpha)
-        );
-        vec4 pressedColor = vec4(
-          gradientColor(zProgress, uPressedKeys[0], uPressedKeys[1], uPressedKeys[2], uPressedKeys[3], uPressedCount),
-          gradientAlpha(zProgress, uPressedAlpha)
-        );
-        vec4 guideColor = uGuideColor;
-        vec4 lineColor = mix(normalColor, pressedColor, uPressed);
-        lineColor = mix(lineColor, guideColor, uGuide);
-        // CalculateFadeInAlpha leaves progress <= 1 untouched, then fades
-        // 1 -> 0 only across the over-spawn interval 1..1.01.
-        float fadeIn = 1.0 - clamp(
-          (vApproach - 1.0) / max(0.0001, uFadeInProgressRange),
-          0.0,
-          1.0
-        );
-        vec4 outputColor = texel * lineColor;
-        // The compiled Live/Unlit/SlideLine glow block is not
-        // text-extractable; the serialized float names define a symmetric
-        // across-width band whose half-width is GlowWidth scaled by the
-        // enabled/pressed state, dimming with GlowFalloff exponents.
-        float across = abs(vUv.x - 0.5) * 2.0;
-        float glowScale = mix(uGlowEnabledScale, uGlowPressedScale, uPressed);
-        float glow = exp(-uGlowFalloff * across / max(0.0001, uGlowWidth * glowScale));
-        outputColor.rgb += uGlowColor.rgb * (uGlowIntensity * glow * texel.a);
-        outputColor.a *= uOpacity * fadeIn;
-        if (outputColor.a < 0.001) discard;
-        gl_FragColor = outputColor;
+        if (vLocalPosition.z < uZMin || uZMax < vLocalPosition.z) discard;
+
+        float width = vLocalBounds.y - vLocalBounds.x;
+        float across = width > 0.00001
+          ? saturate((vLocalPosition.x - vLocalBounds.x) / width)
+          : 0.5;
+        vec2 mainUv = vec2(mix(vTexCoord.x, vTexCoord.y, across), vTexCoord.w);
+        vec4 mainA = texture2D(uMap, mainUv);
+        vec3 mainB = texture2D(uMap, mainUv + vec2(0.0, 0.166666001)).rgb;
+        vec3 sampledMain = mix(mainA.rgb, mainB, vTexCoord.z);
+        vec4 gradient = texture2D(uGradientTex, vec2(vColor.r, uGradientState * 0.333333343 + 0.166666672));
+        float baseAlpha = mainA.a * uColor.a * vColor.a;
+
+        // Guide ribbons are not proven to share the selected main slide-line
+        // material contract. Keep their established visual path separate.
+        if (uGuide > 0.5) {
+          vec4 guideTexel = texture2D(uMap, vUv);
+          vec4 guideOutput = guideTexel * uGuideColor;
+          float guideScale = uGradientState >= 1.5 ? uGlowPressedScale : uGlowEnabledScale;
+          float guideGlow = exp(
+            -uGlowFalloff * abs(vUv.x - 0.5) * 2.0 /
+            max(0.0001, uGlowWidth * guideScale)
+          );
+          guideOutput.rgb += uGlowColor.rgb * (uGlowIntensity * guideGlow * guideTexel.a);
+          guideOutput.a *= vColor.a;
+          if (guideOutput.a < 0.001) discard;
+          gl_FragColor = guideOutput;
+          return;
+        }
+
+        vec3 baseRgb = sampledMain * gradient.rgb * uColor.rgb;
+        float stateScale = uGradientState < 0.5
+          ? uGlowDisabledScale
+          : (uGradientState < 1.5 ? uGlowEnabledScale : uGlowPressedScale);
+        float glowBase = saturate(vColor.g / max(uGlowWidth, 0.001));
+        float glowPower = glowBase <= 0.0 ? 0.0 : exp2(log2(glowBase) * uGlowFalloff);
+        float glow = glowPower * uGlowIntensity * stateScale;
+        vec3 hsv = rgbToHsv(baseRgb);
+        vec3 adjusted = hsvToRgb(vec3(hsv.x, saturate(hsv.y - glow), saturate(hsv.z + glow)));
+        vec3 outputRgb = mix(adjusted, uGlowColor.rgb, glow);
+
+        float coverageDistance = width * (1.0 - vColor.g);
+        float derivative = abs(dFdx(coverageDistance)) + abs(dFdy(coverageDistance));
+        float coverage = width > 0.00001
+          ? saturate(coverageDistance / max(derivative, 0.00001))
+          : 1.0;
+        float outputAlpha = mix(baseAlpha * gradient.a, baseAlpha, glow) * coverage;
+        gl_FragColor = vec4(outputRgb, outputAlpha);
       }
     `,
     transparent: true,
     depthWrite: false,
     depthTest: true,
-    side: DoubleSide,
+    side: BackSide,
     blending: NormalBlending,
     toneMapped: false,
+    vertexColors: true,
   });
-  // This is a flat ribbon. Three's default two-pass path for transparent
-  // DoubleSide materials only splits its front/back triangles across two draw
-  // calls; a single unculled pass produces the same coverage.
-  material.forceSinglePass = true;
   return material;
 }
 
@@ -242,10 +371,13 @@ export class HoldRibbonLayer {
 
   private readonly projector: StageProjector;
   private readonly assets: OurNotesAssetManifest;
+  private readonly style: ResolvedSlideLineStyle;
   private readonly visuals = new Map<RenderHold["id"], HoldVisual>();
   private readonly pool: HoldVisual[] = [];
   private readonly maximumSamplesById = new Map<RenderHold["id"], number>();
-  private readonly fallbackTexture = makeTransparentTexture();
+  private readonly fallbackTexture: DataTexture;
+  private readonly gradientTexture: DataTexture;
+  private readonly normalAlphaScale: number;
   private slideTexture?: Texture;
   private disposed = false;
   private updateEpoch = 0;
@@ -257,10 +389,16 @@ export class HoldRibbonLayer {
   constructor(projector: StageProjector, assets: OurNotesAssetManifest) {
     this.projector = projector;
     this.assets = assets;
+    this.style = resolveStyle(assets.slideLineStyle, assets.source.noteSkin);
+    const gradient = makeGradientTexture(this.style);
+    this.gradientTexture = gradient.texture;
+    this.normalAlphaScale = gradient.normalMaxAlpha > 0 ? 1 / gradient.normalMaxAlpha : 1;
+    this.fallbackTexture = makeFallbackTexture(Boolean(assets.particles.slideLineTextureUrl));
     this.group.name = "OurNotesHoldRibbons";
   }
 
   async loadTexture(loader = new TextureLoader()): Promise<void> {
+    if (!this.assets.particles.slideLineTextureUrl) return;
     const texture = await loader.loadAsync(this.assets.particles.slideLineTextureUrl);
     texture.colorSpace = SRGBColorSpace;
     texture.wrapS = ClampToEdgeWrapping;
@@ -282,29 +420,26 @@ export class HoldRibbonLayer {
   update(holds: ReadonlyArray<RenderHold> | undefined, _time: number): void {
     const epoch = ++this.updateEpoch;
     for (const hold of holds ?? []) {
-      if (hold.visible === false || hold.points.length < 2) continue;
-      const requiredSamples = sampleCount(hold.points);
-      const knownMaximum = this.maximumSamplesById.get(hold.id) ?? 0;
-      if (requiredSamples > knownMaximum) this.maximumSamplesById.set(hold.id, requiredSamples);
-      let visual = this.visuals.get(hold.id);
+      const nativeHold = hold as NativeRenderHold;
+      if (nativeHold.visible === false || nativeHold.points.length < 2) continue;
+      const requiredSamples = sampleCount(nativeHold.points);
+      const knownMaximum = this.maximumSamplesById.get(nativeHold.id) ?? 0;
+      if (requiredSamples > knownMaximum) this.maximumSamplesById.set(nativeHold.id, requiredSamples);
+      let visual = this.visuals.get(nativeHold.id);
       if (!visual) {
-        visual = this.acquireVisual(hold, Math.max(requiredSamples, knownMaximum));
-        this.visuals.set(hold.id, visual);
+        visual = this.acquireVisual(nativeHold, Math.max(requiredSamples, knownMaximum));
+        this.visuals.set(nativeHold.id, visual);
         this.group.add(visual.mesh);
       }
       visual.lastSeen = epoch;
-      this.updateGeometry(visual, hold.points, requiredSamples);
-      const opacity = clamp01(hold.alpha ?? 1);
-      if (visual.lastOpacity !== opacity) {
-        visual.material.uniforms.uOpacity.value = opacity;
-        visual.lastOpacity = opacity;
+      const opacity = clamp01(nativeHold.alpha ?? 1);
+      this.updateGeometry(visual, nativeHold.points, requiredSamples, opacity, nativeHold.minimumWidth);
+      const state = nativeHold.active ? 2 : nativeHold.missed ? 0 : 1;
+      if (visual.lastState !== state) {
+        visual.material.uniforms.uGradientState.value = state;
+        visual.lastState = state;
       }
-      const pressed = hold.active ? 1 : 0;
-      if (visual.lastPressed !== pressed) {
-        visual.material.uniforms.uPressed.value = pressed;
-        visual.lastPressed = pressed;
-      }
-      const guide = hold.kind === "guide" ? 1 : 0;
+      const guide = nativeHold.kind === "guide" ? 1 : 0;
       if (visual.lastGuide !== guide) {
         visual.material.uniforms.uGuide.value = guide;
         visual.lastGuide = guide;
@@ -317,7 +452,7 @@ export class HoldRibbonLayer {
     }
   }
 
-  private acquireVisual(hold: RenderHold, requiredSamples: number): HoldVisual {
+  private acquireVisual(hold: NativeRenderHold, requiredSamples: number): HoldVisual {
     let selected = -1;
     let selectedCapacity = Number.POSITIVE_INFINITY;
     let largest = -1;
@@ -343,9 +478,14 @@ export class HoldRibbonLayer {
     return this.createVisual(hold);
   }
 
-  private createVisual(hold: RenderHold): HoldVisual {
+  private createVisual(hold: NativeRenderHold): HoldVisual {
     const geometry = new BufferGeometry();
-    const material = makeMaterial(this.slideTexture ?? this.fallbackTexture, this.assets.slideLineStyle);
+    const material = makeMaterial(
+      this.slideTexture ?? this.fallbackTexture,
+      this.gradientTexture,
+      this.normalAlphaScale,
+      this.style,
+    );
     const mesh = new Mesh(geometry, material);
     mesh.name = `HoldRibbon:${String(hold.id)}`;
     mesh.frustumCulled = false;
@@ -357,13 +497,16 @@ export class HoldRibbonLayer {
       material,
       capacity: 0,
       positions: EMPTY_FLOATS,
-      uvs: EMPTY_FLOATS,
-      approaches: EMPTY_FLOATS,
+      colors: EMPTY_FLOATS,
+      localBounds: EMPTY_FLOATS,
+      texCoords: EMPTY_FLOATS,
+      guideUvs: EMPTY_FLOATS,
       positionUpdateRange: { start: 0, count: 0 },
-      approachUpdateRange: { start: 0, count: 0 },
+      colorUpdateRange: { start: 0, count: 0 },
+      localBoundsUpdateRange: { start: 0, count: 0 },
+      texCoordUpdateRange: { start: 0, count: 0 },
       lastSeen: 0,
-      lastOpacity: Number.NaN,
-      lastPressed: Number.NaN,
+      lastState: Number.NaN,
       lastGuide: Number.NaN,
     };
   }
@@ -376,14 +519,17 @@ export class HoldRibbonLayer {
     while (capacity < requiredSamples) capacity *= 2;
     visual.capacity = capacity;
     this.capacityGrowths += 1;
-    visual.positions = new Float32Array(capacity * RIBBON_COLUMNS * 3);
-    visual.uvs = new Float32Array(capacity * RIBBON_COLUMNS * 2);
-    visual.approaches = new Float32Array(capacity * RIBBON_COLUMNS);
+    const vertexCount = capacity * RIBBON_COLUMNS;
+    visual.positions = new Float32Array(vertexCount * 3);
+    visual.colors = new Float32Array(vertexCount * 4);
+    visual.localBounds = new Float32Array(vertexCount * 2);
+    visual.texCoords = new Float32Array(vertexCount * 4);
+    visual.guideUvs = new Float32Array(vertexCount * 2);
     for (let sample = 0; sample < capacity; sample += 1) {
       for (let column = 0; column < RIBBON_COLUMNS; column += 1) {
         const uvOffset = (sample * RIBBON_COLUMNS + column) * 2;
-        visual.uvs[uvOffset] = RIBBON_U[column]!;
-        visual.uvs[uvOffset + 1] = NORMAL_FRAGMENT_V;
+        visual.guideUvs[uvOffset] = RIBBON_U[column]!;
+        visual.guideUvs[uvOffset + 1] = 0.5;
       }
     }
     const indices = new Uint32Array(Math.max(0, capacity - 1) * 18);
@@ -401,13 +547,19 @@ export class HoldRibbonLayer {
       }
     }
     const position = new BufferAttribute(visual.positions, 3).setUsage(DynamicDrawUsage);
-    const uv = new BufferAttribute(visual.uvs, 2);
-    const approach = new BufferAttribute(visual.approaches, 1).setUsage(DynamicDrawUsage);
+    const color = new BufferAttribute(visual.colors, 4).setUsage(DynamicDrawUsage);
+    const localBounds = new BufferAttribute(visual.localBounds, 2).setUsage(DynamicDrawUsage);
+    const texCoord = new BufferAttribute(visual.texCoords, 4).setUsage(DynamicDrawUsage);
+    const guideUv = new BufferAttribute(visual.guideUvs, 2);
     visual.positionAttribute = position;
-    visual.approachAttribute = approach;
+    visual.colorAttribute = color;
+    visual.localBoundsAttribute = localBounds;
+    visual.texCoordAttribute = texCoord;
     geometry.setAttribute("position", position);
-    geometry.setAttribute("uv", uv);
-    geometry.setAttribute("aApproach", approach);
+    geometry.setAttribute("color", color);
+    geometry.setAttribute("aLocalBounds", localBounds);
+    geometry.setAttribute("aTexCoord", texCoord);
+    geometry.setAttribute("uv", guideUv);
     geometry.setIndex(new BufferAttribute(indices, 1));
     visual.geometry = geometry;
     visual.mesh.geometry = geometry;
@@ -417,12 +569,20 @@ export class HoldRibbonLayer {
     previousGeometry.dispose();
   }
 
-  private updateGeometry(visual: HoldVisual, points: ReadonlyArray<RenderPathPoint>, count: number): void {
+  private updateGeometry(
+    visual: HoldVisual,
+    points: ReadonlyArray<NativeRenderPathPoint>,
+    count: number,
+    opacity: number,
+    minimumWidthOverride: number | undefined,
+  ): void {
     if (count < 2) {
       visual.geometry.setDrawRange(0, 0);
       return;
     }
     this.ensureCapacity(visual, count);
+    const minimumWidth = this.minimumAuthoredWidth(points, minimumWidthOverride);
+    const widthInset = Math.min(Math.max(0, 6 * (1 - this.style.widthScale)), minimumWidth / 2);
     let sampleIndex = 0;
 
     for (let index = 0; index < points.length - 1; index += 1) {
@@ -437,28 +597,61 @@ export class HoldRibbonLayer {
         const t = step / steps;
         const leftT = easing(t, to.leftEasing ?? from.leftEasing);
         const rightT = easing(t, to.rightEasing ?? from.rightEasing);
+        const approach = from.approach + (to.approach - from.approach) * t;
+        const lineProgress = this.interpolateLineProgress(from, to, t);
         this.writeSample(
           visual,
           sampleIndex,
           fromLeft + (toLeft - fromLeft) * leftT,
           fromRight + (toRight - fromRight) * rightT,
-          from.approach + (to.approach - from.approach) * t,
+          approach,
+          lineProgress,
+          widthInset,
+          opacity,
         );
         sampleIndex += 1;
       }
     }
 
     visual.geometry.setDrawRange(0, Math.max(0, sampleIndex - 1) * 18);
+    const vertexCount = sampleIndex * RIBBON_COLUMNS;
     const position = visual.positionAttribute!;
-    const approach = visual.approachAttribute!;
-    visual.positionUpdateRange.count = sampleIndex * RIBBON_COLUMNS * 3;
+    const color = visual.colorAttribute!;
+    const localBounds = visual.localBoundsAttribute!;
+    const texCoord = visual.texCoordAttribute!;
+    visual.positionUpdateRange.count = vertexCount * 3;
     position.updateRanges.length = 1;
     position.updateRanges[0] = visual.positionUpdateRange;
-    visual.approachUpdateRange.count = sampleIndex * RIBBON_COLUMNS;
-    approach.updateRanges.length = 1;
-    approach.updateRanges[0] = visual.approachUpdateRange;
+    visual.colorUpdateRange.count = vertexCount * 4;
+    color.updateRanges.length = 1;
+    color.updateRanges[0] = visual.colorUpdateRange;
+    visual.localBoundsUpdateRange.count = vertexCount * 2;
+    localBounds.updateRanges.length = 1;
+    localBounds.updateRanges[0] = visual.localBoundsUpdateRange;
+    visual.texCoordUpdateRange.count = vertexCount * 4;
+    texCoord.updateRanges.length = 1;
+    texCoord.updateRanges[0] = visual.texCoordUpdateRange;
     position.needsUpdate = true;
-    approach.needsUpdate = true;
+    color.needsUpdate = true;
+    localBounds.needsUpdate = true;
+    texCoord.needsUpdate = true;
+  }
+
+  private minimumAuthoredWidth(points: ReadonlyArray<NativeRenderPathPoint>, override: number | undefined): number {
+    if (typeof override === "number" && Number.isFinite(override)) return Math.max(0, override);
+    let minimum = Number.POSITIVE_INFINITY;
+    for (const point of points) minimum = Math.min(minimum, Math.max(0, point.width));
+    return Number.isFinite(minimum) ? minimum : 0;
+  }
+
+  private interpolateLineProgress(from: NativeRenderPathPoint, to: NativeRenderPathPoint, t: number): number {
+    // Root supplies whole-line authored progress, already preserved through
+    // visible clipping. A zero fallback keeps older DTOs safe but is not a
+    // claim of native parity for callers that omit the new field.
+    const start = typeof from.lineProgress === "number" ? from.lineProgress : 0;
+    const end = typeof to.lineProgress === "number" ? to.lineProgress : start;
+    const amount = f32(t);
+    return f32(f32(start) + f32(f32(end - start) * amount));
   }
 
   private writeSample(
@@ -467,23 +660,68 @@ export class HoldRibbonLayer {
     leftLane: number,
     rightLane: number,
     approach: number,
+    lineProgress: number,
+    widthInset: number,
+    opacity: number,
   ): void {
-    // InsertMeshUnitAtProgress first lerps the center from spawn x=0, then
-    // multiplies converted width by the same progress.
+    // Native widthScale applies an authored-unit inset before projection. The
+    // input width is a whole ribbon width, so shrink symmetrically around its
+    // authored center before asking StageProjector for projected edges.
+    const authoredCenter = (leftLane + rightLane) / 2;
+    const authoredWidth = Math.max(rightLane - leftLane - widthInset, 0);
+    const adjustedLeftLane = authoredCenter - authoredWidth / 2;
+    const adjustedRightLane = authoredCenter + authoredWidth / 2;
     const viewProgress = this.projector.viewProgress(approach);
-    const left = this.projector.laneEdgeToXAtViewProgress(leftLane, viewProgress);
-    const right = this.projector.laneEdgeToXAtViewProgress(rightLane, viewProgress);
-    const z = this.projector.approachToZ(approach);
+    const projectedLeft = this.projector.laneEdgeToXAtViewProgress(adjustedLeftLane, viewProgress);
+    const projectedRight = this.projector.laneEdgeToXAtViewProgress(adjustedRightLane, viewProgress);
+    const outerLeft = Math.min(projectedLeft, projectedRight);
+    const outerRight = Math.max(projectedLeft, projectedRight);
+    const glowHalfWidth = Math.min(
+      viewProgress * this.style.glowRangeScale / 2,
+      Math.max(outerRight - outerLeft, 0) / 2,
+    );
+    const columns = [
+      outerLeft,
+      clamp(outerLeft + glowHalfWidth, outerLeft, outerRight),
+      clamp(outerRight - glowHalfWidth, outerLeft, outerRight),
+      outerRight,
+    ];
+    const leftBorderWidth = columns[1]! - columns[0]!;
+    const rightBorderWidth = columns[3]! - columns[2]!;
+    const leftUvAmount = glowHalfWidth > NATIVE_EPSILON ? clamp01(leftBorderWidth / glowHalfWidth) : 0;
+    const rightUvAmount = glowHalfWidth > NATIVE_EPSILON ? clamp01(rightBorderWidth / glowHalfWidth) : 0;
+    const leftInnerU = 0.5 + (0.125 - 0.5) * leftUvAmount;
+    const rightInnerU = 0.5 + (0.875 - 0.5) * rightUvAmount;
     const y = this.projector.yAtViewProgress(viewProgress) + 0.002;
-    const width = right - left;
+    const z = 0;
+    const fade = approach <= 1 || NATIVE_FADE_RANGE <= 0
+      ? 1
+      : 1 - clamp01((approach - 1) / NATIVE_FADE_RANGE);
+    const alpha = opacity * fade;
     for (let column = 0; column < RIBBON_COLUMNS; column += 1) {
-      const u = RIBBON_U[column]!;
       const vertex = sampleIndex * RIBBON_COLUMNS + column;
       const positionOffset = vertex * 3;
-      visual.positions[positionOffset] = left + width * u;
+      const colorOffset = vertex * 4;
+      const boundsOffset = vertex * 2;
+      const texCoordOffset = vertex * 4;
+      const leftBorder = column < 2;
+      const referenceLeft = leftBorder ? columns[0]! : columns[2]!;
+      const referenceRight = leftBorder ? columns[1]! : columns[3]!;
+      const textureLeft = leftBorder ? 0 : rightInnerU;
+      const textureRight = leftBorder ? leftInnerU : 1;
+      visual.positions[positionOffset] = columns[column]!;
       visual.positions[positionOffset + 1] = y;
       visual.positions[positionOffset + 2] = z;
-      visual.approaches[vertex] = approach;
+      visual.colors[colorOffset] = lineProgress;
+      visual.colors[colorOffset + 1] = column === 0 || column === 3 ? 1 : 0;
+      visual.colors[colorOffset + 2] = 0;
+      visual.colors[colorOffset + 3] = alpha;
+      visual.localBounds[boundsOffset] = referenceLeft;
+      visual.localBounds[boundsOffset + 1] = referenceRight;
+      visual.texCoords[texCoordOffset] = textureLeft;
+      visual.texCoords[texCoordOffset + 1] = textureRight;
+      visual.texCoords[texCoordOffset + 2] = MAIN_TEX_ROW_BLEND;
+      visual.texCoords[texCoordOffset + 3] = MAIN_TEX_ROW_V;
     }
   }
 
@@ -532,7 +770,12 @@ export class HoldRibbonLayer {
     this.pool.length = 0;
     this.maximumSamplesById.clear();
     this.slideTexture?.dispose();
+    this.gradientTexture.dispose();
     this.fallbackTexture.dispose();
     this.group.clear();
   }
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, value));
 }
