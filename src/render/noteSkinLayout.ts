@@ -1,4 +1,5 @@
 import type { SpriteRegion } from "../assets/SpriteAtlas";
+import { OUR_NOTES_BUNDLED_NOTE_ATLASES, sampleNoteSkinCurve } from "@haneoka/cassiopeia-plugin-our-notes";
 import type { OurNotesNoteSkin, RenderDirection, RenderNoteKind } from "@haneoka/cassiopeia-plugin-our-notes";
 
 export interface NoteSkinEndpoint {
@@ -37,6 +38,7 @@ export interface NoteSkinBodyLayout {
 }
 
 export interface NoteSkinOverlayLayout {
+  alpha: number;
   centerX: number;
   centerY: number;
   width: number;
@@ -63,21 +65,10 @@ type NoteSkinArrowInput = {
   width: number;
 };
 
-// SiriusAsset.NoteSideParts in skin001. These are the serialized values used
-// by LiveSpritePartsNoteViewBase, rather than dimensions inferred from a mock
-// canvas shape.
-const COMMON_RIGHT_OVERHANG = [0, 0.07, 0.08, 0.09, 0.11, 0.08, 0.18] as const;
-const COMMON_LEFT_OVERHANG = [0, 0.21, 0.2, 0.19, 0.33, 0.31, 0] as const;
-const SLIDE_END_RIGHT_OVERHANG = [0.18, 0.19, 0.21, 0.24, 0.31, 0.32, 0.48] as const;
-const SLIDE_END_LEFT_OVERHANG = [0.18, 0.31, 0.27, 0.41, 0.38, 0.31, 0] as const;
-const NO_OVERHANG = [0, 0, 0, 0, 0, 0, 0] as const;
 const CENTER_LANE = 11.5;
 const CENTER_BOUNDARY = 12;
-const DIRECTIONAL_ARROW_THRESHOLDS = [5, 7, 10, 13, 16, 19, 21, 99] as const;
-
-const COMMON_OVERHANGS = { right: COMMON_RIGHT_OVERHANG, left: COMMON_LEFT_OVERHANG } as const;
-const SLIDE_END_OVERHANGS = { right: SLIDE_END_RIGHT_OVERHANG, left: SLIDE_END_LEFT_OVERHANG } as const;
-const NO_OVERHANGS = { right: NO_OVERHANG, left: NO_OVERHANG } as const;
+const definition = (kind: RenderNoteKind, skin: OurNotesNoteSkin) =>
+  OUR_NOTES_BUNDLED_NOTE_ATLASES[skin].notes[kind === "guide" ? "trace" : kind];
 
 function clamp(value: number, minimum: number, maximum: number): number {
   return Math.max(minimum, Math.min(maximum, value));
@@ -105,27 +96,10 @@ export function noteSkinPrefix(kind: RenderNoteKind): string {
   }
 }
 
-export function noteSkinDecorationName(kind: RenderNoteKind): string | undefined {
-  switch (kind) {
-    case "tap":
-      return "tap_decoration";
-    case "flick":
-      return "flick_decoration";
-    case "flick-left":
-      return "flick_left_decoration";
-    case "flick-right":
-      return "flick_right_decoration";
-    case "slide-start":
-      return "slide_decoration";
-    case "slide-node":
-      return "slide_connection_icon";
-    case "trace":
-    case "guide":
-      return "note_trace_3";
-    // LiveSlideEndNoteView has no rendered mark SpriteRenderer.
-    case "slide-end":
-      return undefined;
-  }
+export function noteSkinDecorationName(kind: RenderNoteKind, skin: OurNotesNoteSkin = "skin001"): string | undefined {
+  // The slide-end prefab has no mark renderer despite sharing the asset-unit schema.
+  if (kind === "slide-end") return undefined;
+  return definition(kind, skin).centerMarkSprite ?? undefined;
 }
 
 export function noteSkinEffectiveDirection(note: Pick<NoteSkinArrowInput, "kind" | "direction">): RenderDirection {
@@ -138,37 +112,10 @@ export function noteSkinEffectiveDirection(note: Pick<NoteSkinArrowInput, "kind"
 export function noteSkinArrowName(note: NoteSkinArrowInput, skin: OurNotesNoteSkin = "skin001"): string | undefined {
   if (!note.kind.startsWith("flick")) return undefined;
   const direction = noteSkinEffectiveDirection(note);
-  if (direction === "up") {
-    // LiveFlickNoteView._arrowSpriteEntries branches on width < MaxWidth.
-    if (skin === "skin003") {
-      const index = DIRECTIONAL_ARROW_THRESHOLDS.findIndex((threshold) => note.width < threshold);
-      return `notes_flick_arrow_upper_${String(index < 0 ? 8 : index + 1).padStart(2, "0")}`;
-    }
-    const size = note.width < 5 ? "S" : note.width < 12 ? "M" : note.width < 18 ? "L" : "LL";
-    return `notes_flick_arrow_upper_${size}`;
-  }
-  if (direction !== "left" && direction !== "right") return undefined;
-  const index = DIRECTIONAL_ARROW_THRESHOLDS.findIndex((threshold) => note.width < threshold);
-  return `notes_flick_arrow_${direction}_${String(index < 0 ? 8 : index + 1).padStart(2, "0")}`;
-}
-
-function overhangsForKind(kind: RenderNoteKind): {
-  right: ReadonlyArray<number>;
-  left: ReadonlyArray<number>;
-} {
-  if (kind === "slide-end") return SLIDE_END_OVERHANGS;
-  if (kind === "slide-node" || kind === "trace" || kind === "guide") return NO_OVERHANGS;
-  return COMMON_OVERHANGS;
-}
-
-function rightSprite(prefix: string, tilt: number): string {
-  return tilt === 0 ? `${prefix}_R` : `${prefix}_${tilt}`;
-}
-
-function leftSprite(prefix: string, tilt: number): string {
-  // The serialized tilt-6 LeftSprite intentionally reuses the tilt-4 asset.
-  if (tilt === 0) return `${prefix}_L`;
-  return `${prefix}_${tilt === 6 ? -4 : -tilt}`;
+  const kind = direction === "left" ? "flick-left" : direction === "right" ? "flick-right" : "flick";
+  const entries = definition(kind, skin).arrows;
+  const entry = entries.find((entry) => note.width < entry.maxWidth) ?? entries.at(-1);
+  return entry?.sprite ?? undefined;
 }
 
 function tiltValue(distance: number, thresholds: ReadonlyArray<{ distance: number; value: number }>): number {
@@ -185,42 +132,42 @@ function tiltValue(distance: number, thresholds: ReadonlyArray<{ distance: numbe
 export function selectNoteSkinParts(
   note: NoteSkinSelectionInput,
   thresholds: ReadonlyArray<{ distance: number; value: number }>,
+  skin: OurNotesNoteSkin = "skin001",
 ): NoteSkinParts {
-  const prefix = noteSkinPrefix(note.kind);
+  const unit = definition(note.kind, skin);
   const leftBoundary = note.lane;
   const rightBoundary = note.lane + note.width;
   const laneCenter = note.lane + (note.width - 1) / 2;
   const leftTilt = tiltValue(Math.abs(leftBoundary - CENTER_BOUNDARY), thresholds);
   const rightTilt = tiltValue(Math.abs(rightBoundary - CENTER_BOUNDARY), thresholds);
-  const overhangs = overhangsForKind(note.kind);
 
   const fromRight = (tilt: number, flipX: boolean): NoteSkinEndpoint => ({
-    spriteName: rightSprite(prefix, tilt),
-    overhang: overhangs.right[tilt] ?? 0,
+    spriteName: unit.parts.find((part) => part.tilt === tilt)?.rightSprite ?? "",
+    overhang: unit.parts.find((part) => part.tilt === tilt)?.rightOverhang ?? 0,
     flipX,
   });
   const fromLeft = (tilt: number, flipX: boolean): NoteSkinEndpoint => ({
-    spriteName: leftSprite(prefix, tilt),
-    overhang: overhangs.left[tilt] ?? 0,
+    spriteName: unit.parts.find((part) => part.tilt === tilt)?.leftSprite ?? "",
+    overhang: unit.parts.find((part) => part.tilt === tilt)?.leftOverhang ?? 0,
     flipX,
   });
 
   if (leftBoundary < CENTER_BOUNDARY && rightBoundary > CENTER_BOUNDARY) {
     return {
-      mainSpriteName: `${prefix}_0`,
+      mainSpriteName: unit.mainSprite,
       left: fromRight(leftTilt, true),
       right: fromRight(rightTilt, false),
     };
   }
   if (laneCenter < CENTER_LANE) {
     return {
-      mainSpriteName: `${prefix}_0`,
+      mainSpriteName: unit.mainSprite,
       left: fromRight(leftTilt, true),
       right: fromLeft(rightTilt, true),
     };
   }
   return {
-    mainSpriteName: `${prefix}_0`,
+    mainSpriteName: unit.mainSprite,
     left: fromLeft(leftTilt, false),
     right: fromRight(rightTilt, false),
   };
@@ -232,24 +179,16 @@ export function selectNoteSkinParts(
  * The live renderer deliberately changes endpoint sprites with screen
  * position to match its perspective camera. A vertical authoring timeline
  * has no such camera, so carrying that branch across makes the same note bend
- * as it moves between lanes. These are the original skin001 neutral parts;
+ * as it moves between lanes. These are the selected skin's neutral parts;
  * no geometric substitute is introduced.
  */
-export function selectFlatNoteSkinParts(kind: RenderNoteKind): NoteSkinParts {
-  const prefix = noteSkinPrefix(kind);
-  const overhangs = overhangsForKind(kind);
+export function selectFlatNoteSkinParts(kind: RenderNoteKind, skin: OurNotesNoteSkin = "skin001"): NoteSkinParts {
+  const unit = definition(kind, skin);
+  const part = unit.parts.find((entry) => entry.tilt === 0);
   return {
-    mainSpriteName: `${prefix}_0`,
-    left: {
-      spriteName: `${prefix}_L`,
-      overhang: overhangs.left[0] ?? 0,
-      flipX: false,
-    },
-    right: {
-      spriteName: `${prefix}_R`,
-      overhang: overhangs.right[0] ?? 0,
-      flipX: false,
-    },
+    mainSpriteName: unit.mainSprite,
+    left: { spriteName: part?.leftSprite ?? "", overhang: part?.leftOverhang ?? 0, flipX: false },
+    right: { spriteName: part?.rightSprite ?? "", overhang: part?.rightOverhang ?? 0, flipX: false },
   };
 }
 
@@ -384,6 +323,7 @@ export function layoutNoteSkinBody(options: {
 
 export function layoutNoteSkinDecoration(bounds: NoteSkinSpriteBounds, scale: number): NoteSkinOverlayLayout {
   return {
+    alpha: 1,
     centerX: bounds.centerX * scale,
     centerY: bounds.centerY * scale,
     width: bounds.width * scale,
@@ -397,19 +337,36 @@ export function layoutNoteSkinArrow(
   direction: RenderDirection,
   bounds: NoteSkinSpriteBounds,
   scale: number,
+  skin: OurNotesNoteSkin = "skin001",
+  timeSeconds = 0,
+  target?: NoteSkinOverlayLayout,
 ): NoteSkinOverlayLayout {
   const isUpper = spriteName.startsWith("notes_flick_arrow_upper_");
-  const arrowScale = isUpper ? 0.8 : 1;
+  const kind = direction === "left" ? "flick-left" : direction === "right" ? "flick-right" : "flick";
+  const animation = definition(kind, skin).arrowAnimation;
+  const time =
+    animation && animation.duration > 0
+      ? ((timeSeconds % animation.duration) + animation.duration) % animation.duration
+      : 0;
+  const parentScale = isUpper ? 0.800000011920929 : 1;
+  const scaleX = scale * parentScale * (animation ? sampleNoteSkinCurve(animation.scaleX, time) : 1);
+  const scaleY = scale * parentScale * (animation ? sampleNoteSkinCurve(animation.scaleY, time) : 1);
   const rotation = !isUpper && direction === "left" ? Math.PI : 0;
   const rotationCos = Math.cos(rotation);
   const rotationSin = Math.sin(rotation);
-  const centerX = bounds.centerX * scale * arrowScale;
-  const centerY = bounds.centerY * scale * arrowScale;
-  return {
-    centerX: centerX * rotationCos - centerY * rotationSin,
-    centerY: (isUpper ? 1.15 : 1) * scale + centerX * rotationSin + centerY * rotationCos,
-    width: bounds.width * scale * arrowScale,
-    height: bounds.height * scale * arrowScale,
-    rotation,
-  };
+  const centerX = bounds.centerX * scaleX;
+  const centerY = bounds.centerY * scaleY;
+  const positionX = animation ? sampleNoteSkinCurve(animation.x, time) : 0;
+  const positionY = animation ? sampleNoteSkinCurve(animation.y, time) : 1;
+  const layout = target ?? { centerX: 0, centerY: 0, width: 0, height: 0, rotation: 0, alpha: 1 };
+  layout.centerX = positionX * parentScale * scale + centerX * rotationCos - centerY * rotationSin;
+  layout.centerY =
+    ((isUpper ? 0.3499999940395355 : 0) + positionY * parentScale) * scale +
+    centerX * rotationSin +
+    centerY * rotationCos;
+  layout.width = bounds.width * scaleX;
+  layout.height = bounds.height * scaleY;
+  layout.rotation = rotation;
+  layout.alpha = animation ? clamp(sampleNoteSkinCurve(animation.alpha, time), 0, 1) : 1;
+  return layout;
 }

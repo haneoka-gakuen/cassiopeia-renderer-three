@@ -1,5 +1,7 @@
 import { ClampToEdgeWrapping, LinearFilter, Matrix3, MeshBasicMaterial, SRGBColorSpace, TextureLoader } from "three";
 import type { Texture } from "three";
+import { normalizeSpriteMesh, type SpriteMesh } from "./spriteMesh";
+export type { SpriteMesh } from "./spriteMesh";
 import type { SpriteAtlasManifest, SpriteMetadataRef } from "@haneoka/cassiopeia-plugin-our-notes";
 
 export interface SpriteRect {
@@ -19,6 +21,8 @@ export interface SpriteRegion {
   pixelsToUnits: number;
   /** Unity SpritePackingRotation value read from SpriteAtlas.settingsRaw. */
   packingRotation: 0 | 1 | 2 | 3 | 4;
+  /** Optional authored tight mesh for Simple SpriteRenderers. */
+  mesh?: SpriteMesh;
 }
 
 interface UnitySpriteAsset {
@@ -30,6 +34,8 @@ interface UnitySpriteAsset {
     m_Border?: { x?: number; y?: number; z?: number; w?: number };
     m_PixelsToUnits?: number;
     m_RenderDataKey?: unknown;
+    /** Inline projection of Sprite.m_RD, when the asset pack carries it. */
+    originalRenderData?: { mesh?: unknown };
   };
 }
 
@@ -145,7 +151,9 @@ export class SpriteAtlas {
     const textureLoader = options.textureLoader ?? new TextureLoader();
     const [texture, atlasAsset] = await Promise.all([
       textureLoader.loadAsync(manifest.textureUrl),
-      fetchJson<UnityAtlasAsset>(fetchImpl, manifest.atlasMetadataUrl),
+      manifest.atlasMetadata === undefined
+        ? fetchJson<UnityAtlasAsset>(fetchImpl, manifest.atlasMetadataUrl)
+        : (manifest.atlasMetadata as UnityAtlasAsset),
     ]);
 
     texture.colorSpace = SRGBColorSpace;
@@ -168,7 +176,10 @@ export class SpriteAtlas {
     const results = await Promise.allSettled(
       manifest.sprites.map(async (ref) => ({
         ref,
-        asset: await fetchJson<UnitySpriteAsset>(fetchImpl, ref.metadataUrl),
+        asset:
+          ref.metadata === undefined
+            ? await fetchJson<UnitySpriteAsset>(fetchImpl, ref.metadataUrl)
+            : (ref.metadata as UnitySpriteAsset),
       })),
     );
 
@@ -209,6 +220,7 @@ export class SpriteAtlas {
         },
         pixelsToUnits: Math.max(1, finite(data.m_PixelsToUnits, 100)),
         packingRotation: packingRotation(packed?.settingsRaw),
+        mesh: normalizeSpriteMesh(data.originalRenderData?.mesh),
       });
     });
 

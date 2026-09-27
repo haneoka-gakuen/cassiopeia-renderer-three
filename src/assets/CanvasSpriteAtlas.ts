@@ -1,5 +1,6 @@
 import type { SpriteAtlasManifest, SpriteMetadataRef } from "@haneoka/cassiopeia-plugin-our-notes";
 import type { SpriteRect, SpriteRegion } from "./SpriteAtlas";
+import { normalizeSpriteMesh } from "./spriteMesh";
 
 interface UnitySpriteAsset {
   data?: {
@@ -10,6 +11,7 @@ interface UnitySpriteAsset {
     m_Border?: { x?: number; y?: number; z?: number; w?: number };
     m_PixelsToUnits?: number;
     m_RenderDataKey?: unknown;
+    originalRenderData?: { mesh?: unknown };
   };
 }
 
@@ -88,7 +90,9 @@ export class CanvasSpriteAtlas {
   static async load(manifest: SpriteAtlasManifest): Promise<CanvasSpriteAtlas> {
     const [image, atlasAsset] = await Promise.all([
       loadImage(manifest.textureUrl),
-      fetchJson<UnityAtlasAsset>(manifest.atlasMetadataUrl),
+      manifest.atlasMetadata === undefined
+        ? fetchJson<UnityAtlasAsset>(manifest.atlasMetadataUrl)
+        : (manifest.atlasMetadata as UnityAtlasAsset),
     ]);
     const renderData = new Map<string, UnityAtlasRenderData>();
     for (const entry of atlasAsset.data?.m_RenderDataMap ?? []) {
@@ -98,7 +102,13 @@ export class CanvasSpriteAtlas {
     const regions = new Map<string, SpriteRegion>();
     const missing: string[] = [];
     const results = await Promise.allSettled(
-      manifest.sprites.map(async (ref) => ({ ref, asset: await fetchJson<UnitySpriteAsset>(ref.metadataUrl) })),
+      manifest.sprites.map(async (ref) => ({
+        ref,
+        asset:
+          ref.metadata === undefined
+            ? await fetchJson<UnitySpriteAsset>(ref.metadataUrl)
+            : (ref.metadata as UnitySpriteAsset),
+      })),
     );
     results.forEach((result, index) => {
       const ref: SpriteMetadataRef = manifest.sprites[index]!;
@@ -134,6 +144,7 @@ export class CanvasSpriteAtlas {
         },
         pixelsToUnits: Math.max(1, finite(data.m_PixelsToUnits, 100)),
         packingRotation: packingRotation(packed?.settingsRaw),
+        mesh: normalizeSpriteMesh(data.originalRenderData?.mesh),
       });
     });
     return new CanvasSpriteAtlas(image, regions, missing);

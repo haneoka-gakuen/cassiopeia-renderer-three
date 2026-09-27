@@ -11,7 +11,7 @@ import {
   PlaneGeometry,
   ShaderMaterial,
 } from "three";
-import { SpriteAtlas } from "../assets/SpriteAtlas";
+import { SpriteAtlas, type SpriteMesh, type SpriteRegion } from "../assets/SpriteAtlas";
 import { OUR_NOTES_LIVE_GEOMETRY, type OurNotesAssetManifest } from "@haneoka/cassiopeia-plugin-our-notes";
 import {
   layoutNoteSkinArrow,
@@ -25,6 +25,7 @@ import {
   selectNoteSkinParts,
   type NoteSkinParts,
   type NoteSkinSpriteBounds,
+  type NoteSkinOverlayLayout,
 } from "./noteSkinLayout";
 import type { RenderNote, RenderNoteKind } from "@haneoka/cassiopeia-plugin-our-notes";
 import { StageProjector } from "./stageGeometry";
@@ -33,12 +34,14 @@ interface NoteVisual {
   root: Group;
   signature: string;
   materials: MeshBasicMaterial[];
-  /** Merged body: left edge + three sliced strips + right edge in one mesh. */
+  /** Merged body: native cap meshes + three sliced main strips in one mesh. */
   body: Mesh<BufferGeometry, MeshBasicMaterial>;
   bodyPositions: BufferAttribute;
-  decoration?: Mesh<PlaneGeometry, MeshBasicMaterial>;
+  bodyCaps: readonly [BodyCap, BodyCap];
+  decoration?: Mesh<BufferGeometry, MeshBasicMaterial>;
   /** skin003 flick arrows use a shader-driven gradient instead of the atlas material. */
-  arrow?: Mesh<PlaneGeometry, MeshBasicMaterial | ShaderMaterial>;
+  arrow?: Mesh<BufferGeometry, MeshBasicMaterial | ShaderMaterial>;
+  arrowLayout?: NoteSkinOverlayLayout;
   arrowGradientMaterial?: ShaderMaterial;
   parts: NoteSkinParts;
   decorationName?: string;
@@ -51,8 +54,14 @@ interface NoteVisual {
   lastEaseMarkEmphasized?: boolean;
 }
 
-/** Left, main-left border, main-middle, main-right border, right. */
-const BODY_QUADS = 5;
+/** Three source quads retain SpriteRenderer drawMode=Sliced borders. */
+const MAIN_BODY_QUADS = 3;
+
+interface BodyCap {
+  region?: SpriteRegion;
+  mesh?: SpriteMesh;
+  vertexOffset: number;
+}
 
 interface NoteDescriptor {
   kind: RenderNoteKind;
@@ -133,7 +142,6 @@ export class NoteLayer {
 
   update(notes: ReadonlyArray<RenderNote> | undefined, timeSeconds = 0): void {
     const epoch = ++this.updateEpoch;
-    if (this.assets.arrowGradient) this.updateArrowGradient(timeSeconds);
     let drawOrdinal = 0;
     for (const note of notes ?? []) {
       if (note.visible === false) continue;
@@ -147,11 +155,12 @@ export class NoteLayer {
       }
       visual.lastSeen = epoch;
       this.setSortOrder(visual, drawOrdinal++);
-      this.layout(visual, note);
+      this.layout(visual, note, timeSeconds);
     }
     for (const [id, visual] of this.visuals) {
       if (visual.lastSeen !== epoch) this.releaseVisual(id, visual);
     }
+    if (this.assets.arrowGradient) this.updateArrowGradient(timeSeconds);
   }
 
   /** Advance the skin003 arrow gradient sweep; every arrow shares one clock. */
@@ -195,9 +204,10 @@ export class NoteLayer {
     ) {
       return cached;
     }
-    const parts = selectNoteSkinParts(note, this.assets.tiltThresholds);
+    const skin = this.assets.source?.noteSkin ?? "skin001";
+    const parts = selectNoteSkinParts(note, this.assets.tiltThresholds, skin);
     const arrowName = noteSkinArrowName(note, this.assets.source?.noteSkin ?? "skin001");
-    const decorationName = noteSkinDecorationName(note.kind);
+    const decorationName = noteSkinDecorationName(note.kind, skin);
     const descriptor: NoteDescriptor = {
       kind: note.kind,
       lane: note.lane,
@@ -233,17 +243,30 @@ export class NoteLayer {
     root.name = `RenderNote:${String(note.id)}`;
     const materials: MeshBasicMaterial[] = [];
 
-    // The five body quads (left edge, three sliced strips, right edge) share
-    // one geometry and one material over the raw atlas, with each quad's UV
-    // baked to its own atlas region. That collapses what used to be five
-    // meshes/materials (five draw calls) into one. Positions are filled by
-    // layout(); UVs and the index are fixed for the visual's lifetime.
+    // The three sliced main strips and both native cap meshes share one
+    // geometry/material over the raw atlas. Simple endpoint Sprites must keep
+    // their authored triangles: their packed textureRect is a tight crop and
+    // a bounding quad samples neighboring atlas corners. Positions are filled
+    // by layout(); UVs and the index are fixed for the visual's lifetime.
     const bodyGeometry = new BufferGeometry();
-    const bodyPositions = new BufferAttribute(new Float32Array(BODY_QUADS * 4 * 3), 3);
+    const leftRegion = this.atlas?.region(parts.left.spriteName);
+    const rightRegion = this.atlas?.region(parts.right.spriteName);
+    const bodyCaps: [BodyCap, BodyCap] = [
+      { region: leftRegion, mesh: leftRegion?.mesh, vertexOffset: MAIN_BODY_QUADS * 4 },
+      {
+        region: rightRegion,
+        mesh: rightRegion?.mesh,
+        vertexOffset: MAIN_BODY_QUADS * 4 + (leftRegion?.mesh?.positions.length ?? 4),
+      },
+    ];
+    const bodyVertexCount =
+      MAIN_BODY_QUADS * 4 + (leftRegion?.mesh?.positions.length ?? 4) + (rightRegion?.mesh?.positions.length ?? 4);
+    const bodyPositions = new BufferAttribute(new Float32Array(bodyVertexCount * 3), 3);
     bodyPositions.setUsage(DynamicDrawUsage);
-    const bodyUv = new BufferAttribute(new Float32Array(BODY_QUADS * 4 * 2), 2);
-    const bodyIndex = new Uint16Array(BODY_QUADS * 6);
-    for (let quad = 0; quad < BODY_QUADS; quad += 1) {
+    const bodyUv = new BufferAttribute(new Float32Array(bodyVertexCount * 2), 2);
+    const capIndexCount = bodyCaps.reduce((total, cap) => total + (cap.mesh?.indices.length ?? 6), 0);
+    const bodyIndex = new Uint16Array(MAIN_BODY_QUADS * 6 + capIndexCount);
+    for (let quad = 0; quad < MAIN_BODY_QUADS; quad += 1) {
       const base = quad * 4;
       const offset = quad * 6;
       bodyIndex[offset] = base;
@@ -255,16 +278,41 @@ export class NoteLayer {
     }
     const mainRegion = this.atlas?.region(parts.mainSpriteName);
     const mainSlices = mainRegion ? noteSkinTightHorizontalSlices(mainRegion) : undefined;
-    const bodyUvTransforms = [
-      this.atlas?.regionUvTransform(parts.left.spriteName),
+    const mainUvTransforms = [
       mainSlices ? this.atlas?.regionUvTransform(parts.mainSpriteName, mainSlices[0]) : undefined,
       mainSlices ? this.atlas?.regionUvTransform(parts.mainSpriteName, mainSlices[1]) : undefined,
       mainSlices ? this.atlas?.regionUvTransform(parts.mainSpriteName, mainSlices[2]) : undefined,
-      this.atlas?.regionUvTransform(parts.right.spriteName),
     ];
     const uvArray = bodyUv.array as Float32Array;
-    for (let quad = 0; quad < BODY_QUADS; quad += 1) {
-      NoteLayer.bakeQuadUv(uvArray, quad * 8, bodyUvTransforms[quad]);
+    for (let quad = 0; quad < MAIN_BODY_QUADS; quad += 1) {
+      NoteLayer.bakeQuadUv(uvArray, quad * 8, mainUvTransforms[quad]);
+    }
+    const bodyCapUvTransforms = bodyCaps.map((cap, index) =>
+      this.atlas?.regionUvTransform(index === 0 ? parts.left.spriteName : parts.right.spriteName),
+    );
+    for (let index = 0; index < bodyCaps.length; index += 1) {
+      const cap = bodyCaps[index]!;
+      const uvOffset = cap.vertexOffset * 2;
+      const transform = bodyCapUvTransforms[index];
+      if (cap.mesh && cap.region && transform) {
+        NoteLayer.bakeNativeSpriteUv(uvArray, uvOffset, cap.mesh, cap.region, transform);
+      } else {
+        NoteLayer.bakeQuadUv(uvArray, uvOffset, transform);
+      }
+    }
+    let indexOffset = MAIN_BODY_QUADS * 6;
+    for (const cap of bodyCaps) {
+      const base = cap.vertexOffset;
+      if (cap.mesh) {
+        for (const index of cap.mesh.indices) bodyIndex[indexOffset++] = base + index;
+      } else {
+        bodyIndex[indexOffset++] = base;
+        bodyIndex[indexOffset++] = base + 1;
+        bodyIndex[indexOffset++] = base + 2;
+        bodyIndex[indexOffset++] = base;
+        bodyIndex[indexOffset++] = base + 2;
+        bodyIndex[indexOffset++] = base + 3;
+      }
     }
     bodyUv.needsUpdate = true;
     bodyGeometry.setAttribute("position", bodyPositions);
@@ -276,7 +324,11 @@ export class NoteLayer {
     const body = new Mesh(bodyGeometry, bodyMaterial);
     // A missing endpoint or main slice must not turn into the full atlas via
     // identity UVs. Keep the note closed until every native body part exists.
-    body.visible = bodyUvTransforms.every(Boolean);
+    body.visible =
+      mainUvTransforms.every(Boolean) &&
+      bodyCapUvTransforms.every(
+        (transform, index) => Boolean(transform) || !(index === 0 ? parts.left.spriteName : parts.right.spriteName),
+      );
     // Positions are rewritten by layout(); disable culling so a stale bounding
     // sphere never hides the note. Active notes are always in the view window.
     body.frustumCulled = false;
@@ -287,7 +339,7 @@ export class NoteLayer {
     if (decorationName) {
       const material = this.material(decorationName);
       materials.push(material);
-      decoration = new Mesh(this.plane, material);
+      decoration = new Mesh(this.spriteGeometry(decorationName), material);
       decoration.name = "note-mark";
       decoration.renderOrder = OUR_NOTES_LIVE_GEOMETRY.sortingOrders.noteDecoration;
       root.add(decoration);
@@ -297,10 +349,9 @@ export class NoteLayer {
     let arrowGradientMaterial: NoteVisual["arrowGradientMaterial"];
     if (arrowName) {
       arrowGradientMaterial = this.arrowGradientMaterial(arrowName);
-      const material: MeshBasicMaterial | ShaderMaterial =
-        arrowGradientMaterial ?? this.material(arrowName);
+      const material: MeshBasicMaterial | ShaderMaterial = arrowGradientMaterial ?? this.material(arrowName);
       if (!arrowGradientMaterial) materials.push(material as MeshBasicMaterial);
-      arrow = new Mesh(this.plane, material);
+      arrow = new Mesh(this.spriteGeometry(arrowName), material);
       arrow.name = "flick-arrow";
       arrow.renderOrder = OUR_NOTES_LIVE_GEOMETRY.sortingOrders.noteArrow;
       root.add(arrow);
@@ -312,8 +363,10 @@ export class NoteLayer {
       materials,
       body,
       bodyPositions,
+      bodyCaps,
       decoration,
       arrow,
+      arrowLayout: arrow ? { centerX: 0, centerY: 0, width: 0, height: 0, rotation: 0, alpha: 1 } : undefined,
       arrowGradientMaterial,
       parts,
       decorationName,
@@ -353,6 +406,66 @@ export class NoteLayer {
     });
     material.forceSinglePass = true;
     return material;
+  }
+
+  /**
+   * Build a Simple Sprite geometry from the authored native mesh. Overlay
+   * meshes keep normalized tight-crop UVs because their material owns the
+   * atlas region transform. The shared PlaneGeometry remains a compatibility
+   * fallback for projections that predate inline mesh metadata.
+   */
+  private spriteGeometry(spriteName: string): BufferGeometry {
+    const region = this.atlas?.region(spriteName);
+    const mesh = region?.mesh;
+    if (!region || !mesh) return this.plane;
+    const bounds = noteSkinSpriteBounds(region);
+    const geometry = new BufferGeometry();
+    const positions = new BufferAttribute(new Float32Array(mesh.positions.length * 3), 3);
+    const uv = new BufferAttribute(new Float32Array(mesh.positions.length * 2), 2);
+    const positionArray = positions.array as Float32Array;
+    const uvArray = uv.array as Float32Array;
+    mesh.positions.forEach((position, index) => {
+      // Keep the common overlay layout in charge of scale, pivot and rotation.
+      positionArray[index * 3] = (position[0] - bounds.centerX) / bounds.width;
+      positionArray[index * 3 + 1] = (position[1] - bounds.centerY) / bounds.height;
+      positionArray[index * 3 + 2] = position[2];
+      NoteLayer.bakeTightSpriteUv(uvArray, index * 2, position, region);
+    });
+    geometry.setAttribute("position", positions);
+    geometry.setAttribute("uv", uv);
+    geometry.setIndex(new BufferAttribute(new Uint16Array(mesh.indices), 1));
+    return geometry;
+  }
+
+  /** Convert native Sprite-unit coordinates into normalized tight-crop UVs. */
+  private static bakeTightSpriteUv(
+    uv: Float32Array,
+    offset: number,
+    position: readonly [number, number, number],
+    region: SpriteRegion,
+  ): void {
+    const tightWidth = region.packingRotation === 4 ? region.rect.height : region.rect.width;
+    const tightHeight = region.packingRotation === 4 ? region.rect.width : region.rect.height;
+    const sourceX = position[0] * region.pixelsToUnits + region.pivot.x * region.sourceSize.width;
+    const sourceY = position[1] * region.pixelsToUnits + region.pivot.y * region.sourceSize.height;
+    uv[offset] = Math.max(0, Math.min(1, (sourceX - region.offset.x) / Math.max(1e-6, tightWidth)));
+    uv[offset + 1] = Math.max(0, Math.min(1, (sourceY - region.offset.y) / Math.max(1e-6, tightHeight)));
+  }
+
+  /** Bake one native cap mesh into atlas UVs for the shared body material. */
+  private static bakeNativeSpriteUv(
+    uv: Float32Array,
+    offset: number,
+    mesh: SpriteMesh,
+    region: SpriteRegion,
+    transform: { a: number; b: number; c: number; d: number; e: number; f: number },
+  ): void {
+    const tightUv = new Float32Array(2);
+    mesh.positions.forEach((position, index) => {
+      NoteLayer.bakeTightSpriteUv(tightUv, 0, position, region);
+      uv[offset + index * 2] = transform.a * tightUv[0]! + transform.b * tightUv[1]! + transform.e;
+      uv[offset + index * 2 + 1] = transform.c * tightUv[0]! + transform.d * tightUv[1]! + transform.f;
+    });
   }
 
   /** Write one body quad's four baked UV corners for base uv (0,0)(1,0)(1,1)(0,1). */
@@ -409,11 +522,8 @@ export class NoteLayer {
   }
 
   /**
-   * skin003 ArrowGradientSettings: the Sirius/ArrowGradientCenter shader
-   * sweeps a brightness band along each flick arrow. The compiled shader is
-   * not text-extractable, so this recreates the sweep from the serialized
-   * settings — a MinAlpha floor with a band travelling base→tip every
-   * duration; left/right arrows use the wider directional band width.
+   * Skin003 brightness sweep, with a minimum alpha and separate band widths
+   * for upper and directional arrows.
    */
   private arrowGradientMaterial(spriteName: string): ShaderMaterial | undefined {
     const gradient = this.assets.arrowGradient;
@@ -428,9 +538,15 @@ export class NoteLayer {
         uMap: { value: map },
         uUvTransform: {
           value: new Matrix3().set(
-            transform.a, transform.b, transform.e,
-            transform.c, transform.d, transform.f,
-            0, 0, 1,
+            transform.a,
+            transform.b,
+            transform.e,
+            transform.c,
+            transform.d,
+            transform.f,
+            0,
+            0,
+            1,
           ),
         },
         uGradientOffset: { value: 1 },
@@ -493,7 +609,9 @@ export class NoteLayer {
   }
 
   private spriteBounds(spriteName: string | undefined): NoteSkinSpriteBounds | undefined {
-    if (!spriteName) return undefined;
+    if (spriteName === undefined) return undefined;
+    // A null native cap reference leaves that endpoint SpriteRenderer empty.
+    if (spriteName === "") return { width: 0, height: 0, centerX: 0, centerY: 0 };
     const cached = this.bounds.get(spriteName);
     if (cached) return cached;
     const region = this.atlas?.region(spriteName);
@@ -503,7 +621,30 @@ export class NoteLayer {
     return bounds;
   }
 
-  private layout(visual: NoteVisual, note: RenderNote): void {
+  /** Place an authored Simple Sprite mesh in the same pivot frame as Unity. */
+  private static bakeNativeSpritePositions(
+    positions: Float32Array,
+    offset: number,
+    mesh: SpriteMesh,
+    bounds: NoteSkinSpriteBounds,
+    centerX: number,
+    centerY: number,
+    scale: number,
+    flipX: boolean,
+  ): void {
+    const sourceCenterX = (flipX ? -bounds.centerX : bounds.centerX) * scale;
+    const sourceCenterY = bounds.centerY * scale;
+    const originX = centerX - sourceCenterX;
+    const originY = centerY - sourceCenterY;
+    mesh.positions.forEach((position, index) => {
+      const x = flipX ? -position[0] : position[0];
+      positions[offset + index * 3] = originX + x * scale;
+      positions[offset + index * 3 + 1] = originY + position[1] * scale;
+      positions[offset + index * 3 + 2] = position[2] * scale;
+    });
+  }
+
+  private layout(visual: NoteVisual, note: RenderNote, timeSeconds: number): void {
     const scale = Math.max(0.05, note.scale ?? 1);
     const layoutChanged = visual.layoutWidth !== note.width || visual.layoutScale !== scale;
     if (layoutChanged) {
@@ -528,29 +669,35 @@ export class NoteLayer {
         visual.body.visible = false;
       } else if (visual.body.visible) {
         const positions = visual.bodyPositions.array as Float32Array;
-        const quads = [
-          bodyLayout.left,
-          bodyLayout.mainLeft,
-          bodyLayout.mainMiddle,
-          bodyLayout.mainRight,
-          bodyLayout.right,
-        ];
-        quads.forEach((quad, index) => {
+        const mainQuads = [bodyLayout.mainLeft, bodyLayout.mainMiddle, bodyLayout.mainRight];
+        mainQuads.forEach((quad, index) => {
           NoteLayer.bakeQuadPositions(positions, index * 12, quad.centerX, quad.centerY, quad.width, quad.height);
+        });
+        const capQuads = [bodyLayout.left, bodyLayout.right] as const;
+        const capBounds = [leftBounds, rightBounds] as const;
+        const capFlips = [visual.parts.left.flipX, visual.parts.right.flipX] as const;
+        capQuads.forEach((quad, index) => {
+          const cap = visual.bodyCaps[index]!;
+          const bounds = capBounds[index]!;
+          const offset = cap.vertexOffset * 3;
+          if (cap.mesh) {
+            NoteLayer.bakeNativeSpritePositions(
+              positions,
+              offset,
+              cap.mesh,
+              bounds,
+              quad.centerX,
+              quad.centerY,
+              scale,
+              capFlips[index],
+            );
+          } else {
+            NoteLayer.bakeQuadPositions(positions, offset, quad.centerX, quad.centerY, quad.width, quad.height);
+          }
         });
         visual.bodyPositions.needsUpdate = true;
       }
 
-      if (visual.arrow) {
-        const bounds = this.spriteBounds(visual.arrowName);
-        visual.arrow.visible = Boolean(bounds && visual.arrowName);
-        if (bounds && visual.arrowName) {
-          const layout = layoutNoteSkinArrow(visual.arrowName, noteSkinEffectiveDirection(note), bounds, scale);
-          visual.arrow.scale.set(layout.width, layout.height, 1);
-          visual.arrow.rotation.z = layout.rotation;
-          visual.arrow.position.set(layout.centerX, layout.centerY, 0);
-        }
-      }
       visual.layoutWidth = note.width;
       visual.layoutScale = scale;
     }
@@ -578,6 +725,26 @@ export class NoteLayer {
       if (visual.arrowGradientMaterial) visual.arrowGradientMaterial.uniforms.uOpacity!.value = alpha;
       visual.lastAlpha = alpha;
     }
+    if (visual.arrow) {
+      const bounds = this.spriteBounds(visual.arrowName);
+      visual.arrow.visible = Boolean(bounds && visual.arrowName);
+      if (bounds && visual.arrowName) {
+        const layout = layoutNoteSkinArrow(
+          visual.arrowName,
+          noteSkinEffectiveDirection(note),
+          bounds,
+          scale,
+          this.assets.source?.noteSkin ?? "skin001",
+          timeSeconds,
+          visual.arrowLayout,
+        );
+        visual.arrow.scale.set(layout.width, layout.height, 1);
+        visual.arrow.rotation.z = layout.rotation;
+        visual.arrow.position.set(layout.centerX, layout.centerY, 0);
+        if (visual.arrowGradientMaterial) visual.arrowGradientMaterial.uniforms.uOpacity!.value = alpha * layout.alpha;
+        else visual.arrow.material.opacity = alpha * layout.alpha;
+      }
+    }
     // LiveNoteViewBase.UpdateView multiplies every component of Vector3.one by
     // the converted view progress before Transform.set_localScale. Width is
     // already authored at judgement size.
@@ -599,6 +766,8 @@ export class NoteLayer {
 
   private disposeVisual(visual: NoteVisual): void {
     visual.body.geometry.dispose();
+    if (visual.decoration && visual.decoration.geometry !== this.plane) visual.decoration.geometry.dispose();
+    if (visual.arrow && visual.arrow.geometry !== this.plane) visual.arrow.geometry.dispose();
     for (const material of visual.materials) {
       if (material.map && this.atlas) this.atlas.releaseMaterial(material);
       else material.dispose();
