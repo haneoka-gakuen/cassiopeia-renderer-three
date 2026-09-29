@@ -148,7 +148,60 @@ interface ParticleSample {
   sizeZ: number;
   color: NativeColor;
   rotation: number;
+  /** Simulated seconds since emission, and the particle's simulated lifetime. */
+  age: number;
+  lifetime: number;
 }
+
+/** One rendered billboard with its stable particle identity. */
+export interface NativeBillboardTrace {
+  texture: BillboardTextureKey;
+  /** Index of the ParticleSystem inside its prefab. */
+  system: number;
+  /** Emission index within that system; stable across ages for one seed. */
+  emission: number;
+  /** Per-particle seed: draws are `nativeParticleRandom(particleSeed + k)`. */
+  particleSeed: number;
+  simulationSpeed: number;
+  age: number;
+  lifetime: number;
+  x: number;
+  y: number;
+  z: number;
+  sizeX: number;
+  sizeY: number;
+  color: Readonly<NativeColor>;
+  rotation: number;
+  maxParticleSize: number;
+  pivotX: number;
+  pivotY: number;
+}
+
+/** One rendered frame/pillar sprite, wall mesh or lane fill (EffectMeshBatch space). */
+export interface NativeMeshTrace {
+  kind: "frame" | "pillar" | "wall" | "lane";
+  name: string;
+  x: number;
+  y: number;
+  z: number;
+  scaleX: number;
+  scaleY: number;
+  scaleZ: number;
+  color: Readonly<NativeColor>;
+  rotationX: number;
+}
+
+/**
+ * Receives every instance ParticleLayer.update() emits. Offline compilers
+ * (the native Sonolus particle build) use it so both targets share one
+ * evaluator instead of maintaining a second copy of the Unity math.
+ */
+export interface NativeEffectTraceSink {
+  billboard(entry: NativeBillboardTrace): void;
+  mesh(entry: NativeMeshTrace): void;
+}
+
+export type NativeJsonReader = (url: string) => Promise<unknown>;
 
 /**
  * A ParticleSystem GameObject can be enabled partway through an Animator
@@ -295,6 +348,8 @@ const PARTICLE_SAMPLE_SCRATCH: ParticleSample = {
   sizeZ: 0,
   color: PARTICLE_COLOR_SCRATCH,
   rotation: 0,
+  age: 0,
+  lifetime: 0,
 };
 
 function record(value: unknown): NativeRecord | undefined {
@@ -328,6 +383,11 @@ function hash(value: string): number {
 
 const UNITY_PARTICLE_RANDOM_MULTIPLIER = 0x6c078965;
 const UNITY_PARTICLE_RANDOM_VALUE_SCALE = Math.fround(1 / 0x7fffff);
+
+/** Unity's seeded particle random stream; `sampleParticle` draws with `seed + k`. */
+export function nativeParticleRandom(seed: number): number {
+  return random(seed);
+}
 
 function random(seed: number): number {
   // Unity's ParticleSystem jobs seed four xorshift words from this LCG, then
@@ -1472,6 +1532,137 @@ function createWallGeometry(): BufferGeometry {
   return geometry;
 }
 
+/** A world-space textured quad: corners in (u0,v0) (u1,v0) (u1,v1) (u0,v1) order. */
+export interface NativeWorldQuad {
+  corners: [Vector3, Vector3, Vector3, Vector3];
+  uv: readonly [u0: number, v0: number, u1: number, v1: number];
+}
+
+/**
+ * TypeScript mirror of the ParticleQuadBatch vertex shader: a vertical
+ * billboard facing `cameraPosition` horizontally, with the renderer pivot and
+ * the max-particle-size clamp evaluated at the particle centre.
+ */
+export function nativeBillboardQuad(
+  trace: NativeBillboardTrace,
+  cameraPosition: Vector3,
+  viewMatrix: { elements: ArrayLike<number> },
+  projectionScaleY: number,
+): NativeWorldQuad {
+  const toCameraX = cameraPosition.x - trace.x;
+  const toCameraZ = cameraPosition.z - trace.z;
+  const horizontalLength = Math.max(Math.hypot(toCameraX, toCameraZ), 0.000001);
+  const rightX = toCameraZ / horizontalLength;
+  const rightZ = -toCameraX / horizontalLength;
+  const e = viewMatrix.elements;
+  const viewZ = e[2]! * trace.x + e[6]! * trace.y + e[10]! * trace.z + e[14]!;
+  const diameter = Math.max(Math.abs(trace.sizeX), Math.abs(trace.sizeY));
+  const screenExtent = (diameter * Math.abs(projectionScaleY)) / (2 * Math.max(Math.abs(viewZ), 0.000001));
+  const particleScale =
+    trace.maxParticleSize > 0 ? Math.min(1, trace.maxParticleSize / Math.max(screenExtent, 0.000001)) : 1;
+  const cosine = Math.cos(trace.rotation);
+  const sine = Math.sin(trace.rotation);
+  const corner = (px: number, py: number): Vector3 => {
+    const ox = (px + trace.pivotX) * trace.sizeX;
+    const oy = (py + trace.pivotY) * trace.sizeY;
+    // GLSL mat2(c, -s, s, c) * v is column-major: (c*x + s*y, -s*x + c*y).
+    const rx = (cosine * ox + sine * oy) * particleScale;
+    const ry = (-sine * ox + cosine * oy) * particleScale;
+    return new Vector3(trace.x + rightX * rx, trace.y + ry, trace.z + rightZ * rx);
+  };
+  return {
+    corners: [corner(-0.5, -0.5), corner(0.5, -0.5), corner(0.5, 0.5), corner(-0.5, 0.5)],
+    uv: [0, 0, 1, 1],
+  };
+}
+
+const NATIVE_MESH_QUADS = new Map<NativeMeshTrace["kind"], ReadonlyArray<{ position: number[][]; uv: number[][] }>>();
+
+function meshQuads(kind: NativeMeshTrace["kind"]): ReadonlyArray<{ position: number[][]; uv: number[][] }> {
+  let quads = NATIVE_MESH_QUADS.get(kind);
+  if (quads) return quads;
+  if (kind === "pillar" || kind === "lane") {
+    // PlaneGeometry(1, 1): the unit quad around the origin.
+    quads = [
+      {
+        position: [
+          [-0.5, -0.5, 0],
+          [0.5, -0.5, 0],
+          [0.5, 0.5, 0],
+          [-0.5, 0.5, 0],
+        ],
+        uv: [
+          [0, 0],
+          [1, 0],
+          [1, 1],
+          [0, 1],
+        ],
+      },
+    ];
+    NATIVE_MESH_QUADS.set(kind, quads);
+    return quads;
+  }
+  const geometry = kind === "frame" ? createSlicedSpriteGeometry() : createWallGeometry();
+  const position = geometry.getAttribute("position");
+  const uv = geometry.getAttribute("uv");
+  const index = geometry.index!;
+  const result: Array<{ position: number[][]; uv: number[][] }> = [];
+  // Every source mesh is a list of (a, b, c, a, c, d) triangle pairs.
+  for (let offset = 0; offset + 5 < index.count; offset += 6) {
+    const ids = [index.getX(offset), index.getX(offset + 1), index.getX(offset + 2), index.getX(offset + 5)];
+    result.push({
+      position: ids.map((id) => [position.getX(id), position.getY(id), position.getZ(id)]),
+      uv: ids.map((id) => [uv.getX(id), uv.getY(id)]),
+    });
+  }
+  geometry.dispose();
+  quads = result;
+  NATIVE_MESH_QUADS.set(kind, quads);
+  return quads;
+}
+
+/** TypeScript mirror of the EffectMeshBatch vertex shader (sliced frame, pillar plane, wall mesh). */
+export function nativeMeshQuads(trace: NativeMeshTrace): NativeWorldQuad[] {
+  const pivot = trace.kind === "wall" ? [0, WALL_MESH_SHADER_PIVOT_Y, 0.5] : [0, 0, 0];
+  const cosine = Math.cos(trace.rotationX);
+  const sine = Math.sin(trace.rotationX);
+  const transform = ([px, py, pz]: number[]): Vector3 => {
+    let x = (px! - pivot[0]!) * trace.scaleX;
+    let y = (py! - pivot[1]!) * trace.scaleY;
+    const z = (pz! - pivot[2]!) * trace.scaleZ;
+    if (trace.kind === "frame") {
+      const slice = (tag: number, scale: number, border: number): number =>
+        tag < -1 ? -scale * 0.5 : tag < 0 ? -scale * 0.5 + border : tag < 1 ? scale * 0.5 - border : scale * 0.5;
+      x = slice(px!, trace.scaleX, FRAME_SLICE_BORDER[0]);
+      y = slice(py!, trace.scaleY, FRAME_SLICE_BORDER[1]);
+    }
+    // GLSL mat2(c, s, -s, c) * (y, z) = (c*y - s*z, s*y + c*z).
+    return new Vector3(trace.x + x, trace.y + cosine * y - sine * z, trace.z + sine * y + cosine * z);
+  };
+  return meshQuads(trace.kind).map((quad) => {
+    const us = quad.uv.map((value) => value[0]!);
+    const vs = quad.uv.map((value) => value[1]!);
+    // Reorder the four corners to (u0,v0) (u1,v0) (u1,v1) (u0,v1).
+    const u0 = Math.min(...us);
+    const u1 = Math.max(...us);
+    const v0 = Math.min(...vs);
+    const v1 = Math.max(...vs);
+    const pick = (u: number, v: number): Vector3 => {
+      let best = 0;
+      let bestDistance = Infinity;
+      for (let index = 0; index < 4; index += 1) {
+        const distance = Math.abs(quad.uv[index]![0]! - u) + Math.abs(quad.uv[index]![1]! - v);
+        if (distance < bestDistance) {
+          bestDistance = distance;
+          best = index;
+        }
+      }
+      return transform(quad.position[best]!);
+    };
+    return { corners: [pick(u0, v0), pick(u1, v0), pick(u1, v1), pick(u0, v1)], uv: [u0, v0, u1, v1] };
+  });
+}
+
 function shapePosition(
   system: LoadedParticleSystem,
   seed: number,
@@ -1758,6 +1949,8 @@ function sampleParticle(
   PARTICLE_SAMPLE_SCRATCH.sizeZ = sizeZ * transformScale[2];
   PARTICLE_SAMPLE_SCRATCH.color = initialColor;
   PARTICLE_SAMPLE_SCRATCH.rotation = rotation + rotationOverLifetime;
+  PARTICLE_SAMPLE_SCRATCH.age = age;
+  PARTICLE_SAMPLE_SCRATCH.lifetime = lifetime;
   return PARTICLE_SAMPLE_SCRATCH;
 }
 
@@ -2303,6 +2496,7 @@ export class ParticleLayer {
   private readonly textures = new Map<LoadedTextureKey, Texture>();
   private readonly loadedLaneEffectSystems = new Map<LaneEffectAssetKey, LoadedParticleSystem>();
   private disposed = false;
+  private traceSink: NativeEffectTraceSink | undefined;
   /** Test-only parity switch; production always keeps the incremental path on. */
   private incrementalEmissions = true;
   private updateEpoch = 0;
@@ -2414,6 +2608,24 @@ export class ParticleLayer {
     // scaling was a simulator invention and is intentionally absent.
   }
 
+  /**
+   * Route every emitted instance to `sink` as well as the GPU batches. With a
+   * sink, frame/pillar/wall instances are traced even without decoded textures.
+   */
+  setTraceSink(sink: NativeEffectTraceSink | undefined): void {
+    this.traceSink = sink;
+  }
+
+  /** Load ParticleSystem/AnimationClip definitions only (no textures); Node-safe. */
+  async loadDefinitions(readJson: NativeJsonReader): Promise<void> {
+    const loadErrors: Error[] = [];
+    const { laneEffectSystemResults, prefabResults } = await this.readDefinitions(readJson, loadErrors);
+    if (this.disposed) return;
+    this.applyDefinitions(laneEffectSystemResults, prefabResults, loadErrors);
+    if (loadErrors.length > 0)
+      throw new AggregateError(loadErrors, "One or more native particle resources failed to load");
+  }
+
   async loadTextures(loader = new TextureLoader()): Promise<void> {
     const loadErrors: Error[] = [];
     const errorOf = (reason: unknown, context?: string): Error => {
@@ -2431,17 +2643,60 @@ export class ParticleLayer {
       ["circleIcon", this.assets.particles.circleIconTextureUrl],
       ["laneEffect", this.assets.particles.laneEffects.inVain.textureUrl],
     ];
+    const definitions = this.readDefinitions(async (url) => {
+      const response = await fetch(url, { cache: "force-cache" });
+      if (!response.ok) throw new Error(`${url}: HTTP ${response.status}`);
+      return response.json();
+    }, loadErrors);
     const textureResults = await Promise.allSettled(
       textureRequests.map(async ([key, url]) => [key, configure(await loader.loadAsync(url))] as const),
     );
+    const { laneEffectSystemResults, prefabResults } = await definitions;
+    if (this.disposed) {
+      for (const result of textureResults) if (result.status === "fulfilled") result.value[1].dispose();
+      return;
+    }
+    for (let index = 0; index < textureResults.length; index += 1) {
+      const result = textureResults[index]!;
+      if (result.status !== "fulfilled") {
+        loadErrors.push(errorOf(result.reason, textureRequests[index]?.[1]));
+        continue;
+      }
+      const [key, texture] = result.value;
+      this.textures.get(key)?.dispose();
+      this.textures.set(key, texture);
+      if (
+        key === "star" ||
+        key === "longStar" ||
+        key === "centerPillar" ||
+        key === "centerPillar02" ||
+        key === "circleIcon"
+      )
+        this.batches[key].setTexture(texture);
+      if (key === "line") this.frameBatch.setTexture(texture);
+      if (key === "pillar") this.pillarBatch.setTexture(texture);
+      if (key === "wall") this.wallBatch.setTexture(texture);
+      if (key === "laneEffect") this.laneEffectBatch.setTexture(texture);
+    }
+    this.applyDefinitions(laneEffectSystemResults, prefabResults, loadErrors);
+    if (loadErrors.length > 0)
+      throw new AggregateError(loadErrors, "One or more native particle resources failed to load");
+  }
+
+  private async readDefinitions(
+    readJson: NativeJsonReader,
+    loadErrors: Error[],
+  ): Promise<{
+    laneEffectSystemResults: PromiseSettledResult<readonly [LaneEffectAssetKey, LoadedParticleSystem]>[];
+    prefabResults: LoadedPrefab[];
+  }> {
+    const errorOf = (reason: unknown): Error => (reason instanceof Error ? reason : new Error(String(reason)));
     const laneEffectEntries = Object.entries(this.assets.particles.laneEffects) as Array<
       [LaneEffectAssetKey, LaneEffectParticleAssetRef]
     >;
     const laneEffectSystemResultsPromise = Promise.allSettled(
       laneEffectEntries.map(async ([key, ref]): Promise<readonly [LaneEffectAssetKey, LoadedParticleSystem]> => {
-        const response = await fetch(ref.particleSystemMetadataUrl, { cache: "force-cache" });
-        if (!response.ok) throw new Error(`${ref.particleSystemMetadataUrl}: HTTP ${response.status}`);
-        const parsed = readNativeParticleSystem(await response.json());
+        const parsed = readNativeParticleSystem(await readJson(ref.particleSystemMetadataUrl));
         if (!parsed) throw new Error(`${ref.particleSystemMetadataUrl}: invalid ParticleSystem projection`);
         return [
           key,
@@ -2461,10 +2716,9 @@ export class ParticleLayer {
     const loadAnimation = (url: string): Promise<NativeAnimationClip | undefined> => {
       let request = animationRequests.get(url);
       if (!request) {
-        request = fetch(url, { cache: "force-cache" })
-          .then(async (response) => {
-            if (!response.ok) throw new Error(`${url}: HTTP ${response.status}`);
-            const animation = readNativeAnimationClip(await response.json());
+        request = readJson(url)
+          .then((json) => {
+            const animation = readNativeAnimationClip(json);
             if (!animation) throw new Error(`${url}: invalid AnimationClip projection`);
             return animation;
           })
@@ -2484,9 +2738,7 @@ export class ParticleLayer {
         const [systemResults, animationResult, animationResults, distanceResult] = await Promise.all([
           Promise.allSettled(
             manifest.particleSystems.map(async (ref): Promise<LoadedParticleSystem | undefined> => {
-              const response = await fetch(ref.metadataUrl, { cache: "force-cache" });
-              if (!response.ok) throw new Error(`${ref.metadataUrl}: HTTP ${response.status}`);
-              const parsed = readNativeParticleSystem(await response.json());
+              const parsed = readNativeParticleSystem(await readJson(ref.metadataUrl));
               if (!parsed) throw new Error(`${ref.metadataUrl}: invalid ParticleSystem projection`);
               return loadedParticleSystem(parsed, ref);
             }),
@@ -2520,41 +2772,21 @@ export class ParticleLayer {
       }),
     );
     const laneEffectSystemResults = await laneEffectSystemResultsPromise;
-    if (this.disposed) {
-      for (const result of textureResults) if (result.status === "fulfilled") result.value[1].dispose();
-      return;
-    }
-    for (let index = 0; index < textureResults.length; index += 1) {
-      const result = textureResults[index]!;
-      if (result.status !== "fulfilled") {
-        loadErrors.push(errorOf(result.reason, textureRequests[index]?.[1]));
-        continue;
-      }
-      const [key, texture] = result.value;
-      this.textures.get(key)?.dispose();
-      this.textures.set(key, texture);
-      if (
-        key === "star" ||
-        key === "longStar" ||
-        key === "centerPillar" ||
-        key === "centerPillar02" ||
-        key === "circleIcon"
-      )
-        this.batches[key].setTexture(texture);
-      if (key === "line") this.frameBatch.setTexture(texture);
-      if (key === "pillar") this.pillarBatch.setTexture(texture);
-      if (key === "wall") this.wallBatch.setTexture(texture);
-      if (key === "laneEffect") this.laneEffectBatch.setTexture(texture);
-    }
+    return { laneEffectSystemResults, prefabResults };
+  }
+
+  private applyDefinitions(
+    laneEffectSystemResults: PromiseSettledResult<readonly [LaneEffectAssetKey, LoadedParticleSystem]>[],
+    prefabResults: LoadedPrefab[],
+    loadErrors: Error[],
+  ): void {
     this.loadedLaneEffectSystems.clear();
     for (const result of laneEffectSystemResults) {
       if (result.status === "fulfilled") this.loadedLaneEffectSystems.set(...result.value);
-      else loadErrors.push(errorOf(result.reason));
+      else loadErrors.push(result.reason instanceof Error ? result.reason : new Error(String(result.reason)));
     }
     this.loadedPrefabs.clear();
     for (const prefab of prefabResults) this.loadedPrefabs.set(prefab.manifest.id, prefab);
-    if (loadErrors.length > 0)
-      throw new AggregateError(loadErrors, "One or more native particle resources failed to load");
   }
 
   update(effects: ReadonlyArray<RenderParticleEffect> | undefined): void {
@@ -2615,7 +2847,8 @@ export class ParticleLayer {
       // The per-texture instance batch is the only capacity guard. It is
       // intentionally independent from prefab system order so an earlier
       // high-rate star stream cannot erase authored late glow systems.
-      for (const system of loaded.systems) {
+      for (let systemIndex = 0; systemIndex < loaded.systems.length; systemIndex += 1) {
+        const system = loaded.systems[systemIndex]!;
         if (system.ref.renderer === "wallMesh") continue;
         const playback = particleSystemPlayback(system, manifest, movementAnimation, effect.age);
         if (!playback) continue;
@@ -2664,18 +2897,44 @@ export class ParticleLayer {
             parentWidthScaleX,
           );
           nativeParticleLocalPosition(system.ref, sampleX, sample.y, sample.z, hierarchyScaleX, this.localPointScratch);
+          const worldX = this.pointScratch.x + this.localPointScratch.x * mirror;
+          const worldY = this.pointScratch.y + this.localPointScratch.y;
+          const worldZ = this.pointScratch.z + this.localPointScratch.z;
+          const sizeX = sample.sizeX * hierarchyScaleX * mirror;
+          const rotation = sample.rotation * mirror;
+          const pivotX = system.ref.rendererPivot?.[0] ?? 0;
+          const pivotY = system.ref.rendererPivot?.[1] ?? 0;
           this.batches[system.ref.texture].push(
-            this.pointScratch.x + this.localPointScratch.x * mirror,
-            this.pointScratch.y + this.localPointScratch.y,
-            this.pointScratch.z + this.localPointScratch.z,
-            sample.sizeX * hierarchyScaleX * mirror,
+            worldX,
+            worldY,
+            worldZ,
+            sizeX,
             sample.sizeY,
             sample.color,
-            sample.rotation * mirror,
+            rotation,
             system.ref.rendererMaxParticleSize,
-            system.ref.rendererPivot?.[0] ?? 0,
-            system.ref.rendererPivot?.[1] ?? 0,
+            pivotX,
+            pivotY,
           );
+          this.traceSink?.billboard({
+            texture: system.ref.texture,
+            system: systemIndex,
+            emission: emission.index,
+            particleSeed: systemSeed ^ Math.imul(emission.index + 1, 0x9e3779b9),
+            simulationSpeed: system.simulationSpeed,
+            age: sample.age,
+            lifetime: sample.lifetime,
+            x: worldX,
+            y: worldY,
+            z: worldZ,
+            sizeX,
+            sizeY: sample.sizeY,
+            color: { ...sample.color },
+            rotation,
+            maxParticleSize: system.ref.rendererMaxParticleSize,
+            pivotX,
+            pivotY,
+          });
         }
       }
     }
@@ -2717,6 +2976,18 @@ export class ParticleLayer {
     const color = sample.color;
     const alpha = color.a;
     if (alpha <= 0) return;
+    this.traceSink?.mesh({
+      kind: "lane",
+      name: assetKey,
+      x: this.pointScratch.x + sample.x,
+      y: this.pointScratch.y + sample.z,
+      z: this.pointScratch.z - sample.y,
+      scaleX: sample.sizeX,
+      scaleY: sample.sizeY,
+      scaleZ: sample.sizeZ,
+      color: { ...color },
+      rotationX: LANE_EFFECT_UNITY_TO_THREE_ROTATION_X,
+    });
     this.laneEffectBatch.push(
       this.pointScratch.x + sample.x,
       // LiveGameLaneEffectBase.SetPosition copies the lane root position
@@ -2775,7 +3046,8 @@ export class ParticleLayer {
       const sizeValue = clipBindingValue(animation, path, ATTRIBUTE_SIZE_X, animationTime);
       const active = activeValue === undefined ? spec.baseActive : activeValue >= 0.5;
       const alpha = alphaValue === undefined ? spec.baseColor[3] : clamp(alphaValue);
-      if (!active || alpha <= 0 || !this.textures.has(name === "frame" ? "line" : "pillar")) continue;
+      if (!active || alpha <= 0 || (!this.traceSink && !this.textures.has(name === "frame" ? "line" : "pillar")))
+        continue;
       const x =
         name === "pillar01" || name === "pillar03"
           ? -width / 2
@@ -2790,23 +3062,31 @@ export class ParticleLayer {
       const pivotOffsetY = (0.5 - spec.pivot[1]) * spec.baseSize[1] * spec.localScale[1];
       const rotatedPivotY = pivotOffsetY * Math.cos(rotationX);
       const rotatedPivotZ = pivotOffsetY * Math.sin(rotationX);
-      batch.push(
-        position.x + (x + pivotOffsetX) * manifest.rootScaleX,
-        position.y + spec.localPosition[1] + rotatedPivotY,
-        position.z - spec.localPosition[2] + rotatedPivotZ,
-        sizeX * spec.localScale[0] * manifest.rootScaleX * flipX,
-        spec.baseSize[1] * spec.localScale[1],
-        spec.localScale[2],
-        clipBindingValue(animation, path, SPRITE_COLOR_ATTRIBUTES[0]!, animationTime) ?? spec.baseColor[0],
-        clipBindingValue(animation, path, SPRITE_COLOR_ATTRIBUTES[1]!, animationTime) ?? spec.baseColor[1],
-        clipBindingValue(animation, path, SPRITE_COLOR_ATTRIBUTES[2]!, animationTime) ?? spec.baseColor[2],
-        alpha,
+      const spriteX = position.x + (x + pivotOffsetX) * manifest.rootScaleX;
+      const spriteY = position.y + spec.localPosition[1] + rotatedPivotY;
+      const spriteZ = position.z - spec.localPosition[2] + rotatedPivotZ;
+      const scaleX = sizeX * spec.localScale[0] * manifest.rootScaleX * flipX;
+      const scaleY = spec.baseSize[1] * spec.localScale[1];
+      const red = clipBindingValue(animation, path, SPRITE_COLOR_ATTRIBUTES[0]!, animationTime) ?? spec.baseColor[0];
+      const green = clipBindingValue(animation, path, SPRITE_COLOR_ATTRIBUTES[1]!, animationTime) ?? spec.baseColor[1];
+      const blue = clipBindingValue(animation, path, SPRITE_COLOR_ATTRIBUTES[2]!, animationTime) ?? spec.baseColor[2];
+      batch.push(spriteX, spriteY, spriteZ, scaleX, scaleY, spec.localScale[2], red, green, blue, alpha, rotationX);
+      this.traceSink?.mesh({
+        kind: name === "frame" ? "frame" : "pillar",
+        name,
+        x: spriteX,
+        y: spriteY,
+        z: spriteZ,
+        scaleX,
+        scaleY,
+        scaleZ: spec.localScale[2],
+        color: { r: red, g: green, b: blue, a: alpha },
         rotationX,
-      );
+      });
     }
     const wallSystem = loaded?.wallSystem;
     const wallTexture = this.textures.get("wall");
-    if (!loaded || !wallSystem || !wallTexture) return impact;
+    if (!loaded || !wallSystem || (!wallTexture && !this.traceSink)) return impact;
     const playback = particleSystemPlayback(wallSystem, manifest, animation, age);
     if (!playback) return impact;
     const wallSeed = seed ^ wallSystem.nameHash;
@@ -2843,11 +3123,15 @@ export class ParticleLayer {
       if (!sample) continue;
       if (sample.color.a <= 0) continue;
       nativeParticleLocalPosition(wallSystem.ref, sample.x, sample.y, sample.z, 1, this.localPointScratch);
+      const wallX = position.x + this.localPointScratch.x * manifest.rootScaleX;
+      const wallY = position.y + this.localPointScratch.y;
+      const wallZ = position.z + this.localPointScratch.z;
+      const wallScaleX = Math.max(0, width - 0.15) * sample.sizeX * manifest.rootScaleX;
       this.wallBatch.push(
-        position.x + this.localPointScratch.x * manifest.rootScaleX,
-        position.y + this.localPointScratch.y,
-        position.z + this.localPointScratch.z,
-        Math.max(0, width - 0.15) * sample.sizeX * manifest.rootScaleX,
+        wallX,
+        wallY,
+        wallZ,
+        wallScaleX,
         sample.sizeY,
         sample.sizeZ,
         sample.color.r,
@@ -2855,6 +3139,18 @@ export class ParticleLayer {
         sample.color.b,
         sample.color.a,
       );
+      this.traceSink?.mesh({
+        kind: "wall",
+        name: "wall",
+        x: wallX,
+        y: wallY,
+        z: wallZ,
+        scaleX: wallScaleX,
+        scaleY: sample.sizeY,
+        scaleZ: sample.sizeZ,
+        color: { ...sample.color },
+        rotationX: 0,
+      });
       break;
     }
     return impact;

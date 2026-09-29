@@ -90,8 +90,8 @@ export function liveBloomPassPlan(mipCount: number): readonly number[] {
 export function liveBloomMipLayout(
   outputWidth: number,
   outputHeight: number,
-  renderingScale = OUR_NOTES_LIVE_EFFECT_CAMERA.renderingScale,
-  maxIterations = OUR_NOTES_LIVE_BLOOM.maxIterations,
+  renderingScale: number = OUR_NOTES_LIVE_EFFECT_CAMERA.renderingScale,
+  maxIterations: number = OUR_NOTES_LIVE_BLOOM.maxIterations,
 ): LiveBloomMipLayout {
   const width = Math.max(1, Math.trunc(outputWidth));
   const height = Math.max(1, Math.trunc(outputHeight));
@@ -355,12 +355,15 @@ export class LiveUrpBloomPipeline {
   private readonly fullscreenGeometry = new PlaneGeometry(2, 2);
   private readonly fullscreenMesh = new Mesh(this.fullscreenGeometry, this.prefilterMaterial);
   private readonly clearColor = new Color();
+  private readonly renderingScale: number;
   private mipCount = 1;
   private outputWidth = 0;
   private outputHeight = 0;
   private ready = false;
 
-  constructor() {
+  /** `renderingScale` is the selected MasterLiveQualitySettings effect scale. */
+  constructor(renderingScale: number = OUR_NOTES_LIVE_EFFECT_CAMERA.renderingScale) {
+    this.renderingScale = Number.isFinite(renderingScale) && renderingScale > 0 ? renderingScale : 1;
     this.fullscreenMesh.frustumCulled = false;
     this.fullscreenScene.add(this.fullscreenMesh);
   }
@@ -371,7 +374,7 @@ export class LiveUrpBloomPipeline {
     if (width === this.outputWidth && height === this.outputHeight) return;
     this.outputWidth = width;
     this.outputHeight = height;
-    const layout = liveBloomMipLayout(width, height);
+    const layout = liveBloomMipLayout(width, height, this.renderingScale);
     this.effectTarget.setSize(layout.effectWidth, layout.effectHeight);
     this.mipCount = layout.mips.length;
     for (let index = 0; index < this.mipCount; index += 1) {

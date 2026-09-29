@@ -86,7 +86,7 @@ export class OurNotesRenderer {
   private readonly notes: NoteLayer;
   private readonly particles: ParticleLayer;
   private readonly effectScene = new Scene();
-  private readonly liveBloom = new LiveUrpBloomPipeline();
+  private readonly liveBloom: LiveUrpBloomPipeline;
   private readonly screenRoot = new Group();
   private readonly hud?: HudLayer;
   private atlas?: SpriteAtlas;
@@ -132,6 +132,7 @@ export class OurNotesRenderer {
   constructor(options: OurNotesRendererOptions) {
     this.options = options;
     const assets = options.assets;
+    this.liveBloom = new LiveUrpBloomPipeline(assets.liveQuality?.effectRenderingScale);
     this.projector = new StageProjector({
       laneCount: options.laneCount,
       stageWidth: options.stageWidth,
