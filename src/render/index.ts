@@ -2,6 +2,7 @@ export * from "./HoldRibbon";
 export * from "./HudLayer";
 export * from "./NoteLayer";
 export * from "./OurNotesRenderer";
+export type { OurNotesRendererOptions } from "./OurNotesRenderer";
 export * from "./backgroundMedia";
 export * from "./ParticleLayer";
 export * from "./LiveUrpBloom";

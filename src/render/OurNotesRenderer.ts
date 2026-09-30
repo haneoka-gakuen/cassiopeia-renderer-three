@@ -24,10 +24,12 @@ import { SimultaneousLineLayer } from "./SimultaneousLineLayer";
 import { OurNotesStage, ScreenLaneBackdrop, StageProjector } from "./stageGeometry";
 import {
   isRenderLaneEffectKind,
-  type OurNotesRendererOptions,
+  type OurNotesRendererOptions as PortableRendererOptions,
   type OurNotesRendererStats,
   type RenderFrame,
 } from "@haneoka/cassiopeia-plugin-our-notes";
+
+export type OurNotesRendererOptions = PortableRendererOptions<HTMLCanvasElement>;
 
 const clamp = (value: number, min: number, max: number): number => Math.max(min, Math.min(max, value));
 
