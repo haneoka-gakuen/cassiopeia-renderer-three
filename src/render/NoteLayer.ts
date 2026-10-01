@@ -8,6 +8,9 @@ import {
   Mesh,
   MeshBasicMaterial,
   NormalBlending,
+  CustomBlending,
+  OneFactor,
+  OneMinusSrcAlphaFactor,
   PlaneGeometry,
   ShaderMaterial,
 } from "three";
@@ -43,6 +46,7 @@ interface NoteVisual {
   arrow?: Mesh<BufferGeometry, MeshBasicMaterial | ShaderMaterial>;
   arrowLayout?: NoteSkinOverlayLayout;
   arrowGradientMaterial?: ShaderMaterial;
+  gradientStartedAt: number;
   parts: NoteSkinParts;
   decorationName?: string;
   arrowName?: string;
@@ -150,6 +154,7 @@ export class NoteLayer {
       if (!visual || visual.signature !== descriptor.signature) {
         if (visual) this.releaseVisual(note.id, visual);
         visual = this.acquireVisual(note, descriptor);
+        visual.gradientStartedAt = timeSeconds;
         this.visuals.set(note.id, visual);
         this.group.add(visual.root);
       }
@@ -163,17 +168,16 @@ export class NoteLayer {
     if (this.assets.arrowGradient) this.updateArrowGradient(timeSeconds);
   }
 
-  /** Advance the skin003 arrow gradient sweep; every arrow shares one clock. */
+  /** Each ArrowGradientAnimator starts its sweep when its note view is acquired. */
   private updateArrowGradient(timeSeconds: number): void {
     const gradient = this.assets.arrowGradient!;
     const cycle = Math.max(1e-4, gradient.durationSeconds + gradient.pauseSeconds);
-    const phase = ((timeSeconds % cycle) + cycle) % cycle;
-    const progress = Math.min(1, phase / Math.max(1e-4, gradient.durationSeconds));
     for (const visual of this.visuals.values()) {
       const material = visual.arrowGradientMaterial;
       if (!material) continue;
-      const width = material.uniforms.uBandWidth!.value as number;
-      material.uniforms.uGradientOffset!.value = -width + (1 + 2 * width) * progress;
+      if (timeSeconds < visual.gradientStartedAt) visual.gradientStartedAt = timeSeconds;
+      const phase = (timeSeconds - visual.gradientStartedAt) % cycle;
+      material.uniforms.uGradientOffset!.value = Math.min(1, phase / Math.max(1e-4, gradient.durationSeconds));
     }
   }
 
@@ -368,6 +372,7 @@ export class NoteLayer {
       arrow,
       arrowLayout: arrow ? { centerX: 0, centerY: 0, width: 0, height: 0, rotation: 0, alpha: 1 } : undefined,
       arrowGradientMaterial,
+      gradientStartedAt: 0,
       parts,
       decorationName,
       arrowName,
@@ -533,6 +538,28 @@ export class NoteLayer {
     const transform = this.atlas?.regionUvTransform(spriteName);
     const map = this.atlas?.createTexture(spriteName);
     if (!transform || !map) return undefined;
+    const region = this.atlas?.region(spriteName);
+    let uvMin = Number.POSITIVE_INFINITY;
+    let uvMax = Number.NEGATIVE_INFINITY;
+    const vertices = region?.mesh?.positions;
+    if (region && vertices) {
+      const tightUv = new Float32Array(2);
+      for (const position of vertices) {
+        NoteLayer.bakeTightSpriteUv(tightUv, 0, position, region);
+        const u = transform.a * tightUv[0]! + transform.b * tightUv[1]! + transform.e;
+        uvMin = Math.min(uvMin, u);
+        uvMax = Math.max(uvMax, u);
+      }
+    } else {
+      const corners = [
+        transform.e,
+        transform.a + transform.e,
+        transform.b + transform.e,
+        transform.a + transform.b + transform.e,
+      ];
+      uvMin = Math.min(...corners);
+      uvMax = Math.max(...corners);
+    }
     const material = new ShaderMaterial({
       uniforms: {
         uMap: { value: map },
@@ -552,6 +579,9 @@ export class NoteLayer {
         uGradientOffset: { value: 1 },
         uBandWidth: { value: settings.bandWidth },
         uMinAlpha: { value: settings.minAlpha },
+        uUvMin: { value: uvMin },
+        uUvRange: { value: uvMax - uvMin },
+        uDirectional: { value: directional ? 1 : 0 },
         uOpacity: { value: 1 },
       },
       vertexShader: `
@@ -567,17 +597,27 @@ export class NoteLayer {
         uniform float uGradientOffset;
         uniform float uBandWidth;
         uniform float uMinAlpha;
+        uniform float uUvMin;
+        uniform float uUvRange;
+        uniform float uDirectional;
         uniform float uOpacity;
         varying vec2 vUv;
         void main() {
           vec2 atlasUv = (uUvTransform * vec3(vUv, 1.0)).xy;
           vec4 texel = texture2D(uMap, atlasUv);
-          float band = 1.0 - smoothstep(0.0, uBandWidth * 0.5, abs(vUv.y - uGradientOffset));
-          float alpha = max(uMinAlpha, band);
-          gl_FragColor = vec4(texel.rgb, texel.a * alpha * uOpacity);
+          float across = fract((atlasUv.x - uUvMin) / (uUvRange > 0.0001 ? uUvRange : 1.0));
+          float distance = uDirectional > 0.5
+            ? abs(across - uGradientOffset)
+            : abs(abs(across - 0.5) - uGradientOffset * 0.5);
+          float band = 1.0 - clamp(distance / uBandWidth, 0.0, 1.0);
+          float alpha = (band * (1.0 - uMinAlpha) + uMinAlpha) * texel.a * uOpacity;
+          gl_FragColor = vec4(texel.rgb * alpha, alpha);
         }
       `,
       transparent: true,
+      blending: CustomBlending,
+      blendSrc: OneFactor,
+      blendDst: OneMinusSrcAlphaFactor,
       depthWrite: false,
       side: DoubleSide,
       toneMapped: false,

@@ -22,7 +22,6 @@ import {
   UnsignedByteType,
   Vector2,
   Vector3,
-  Vector4,
 } from "three";
 import type { OneMinusSrcAlphaFactor, Texture } from "three";
 import { EFFECT001_PREFAB_IDS } from "@haneoka/cassiopeia-plugin-our-notes";
@@ -163,6 +162,7 @@ export interface NativeBillboardTrace {
   /** Per-particle seed: draws are `nativeParticleRandom(particleSeed + k)`. */
   particleSeed: number;
   simulationSpeed: number;
+  materialTint?: readonly [number, number, number, number];
   age: number;
   lifetime: number;
   x: number;
@@ -189,6 +189,7 @@ export interface NativeMeshTrace {
   scaleZ: number;
   color: Readonly<NativeColor>;
   rotationX: number;
+  materialTint?: readonly [number, number, number, number];
 }
 
 /**
@@ -948,6 +949,19 @@ function particleSystemPlayback(
     active = nextActive;
   }
   if (activeStart === undefined) return undefined;
+  // An Animator loop does not restart a ParticleSystem whose GameObject
+  // stays active for the entire clip. Keep its emission/simulation age from
+  // the effect's activation; animated properties still sample the loop phase.
+  if (
+    manifest.loopAnimation &&
+    particleSystemActiveAt(animation, paths, 0) &&
+    particleSystemActiveAt(animation, paths, animation.duration) &&
+    animation.frames.every(
+      (frame) =>
+        frame.time <= 0 || frame.time > animation.duration || particleSystemActiveAt(animation, paths, frame.time),
+    )
+  )
+    return { age: Math.max(0, effectAge), animationTimeOffset: 0 };
   return { age: Math.max(0, animationTime - activeStart), animationTimeOffset: cycleStart + activeStart };
 }
 
@@ -1072,11 +1086,14 @@ class ParticleQuadBatch {
   private readonly rotation: InstancedBufferAttribute;
   private readonly pivot: InstancedBufferAttribute;
   private readonly maxParticleSize: InstancedBufferAttribute;
+  private readonly tint: InstancedBufferAttribute;
+  private readonly defaultTint: readonly [number, number, number, number];
   private readonly capacity: number;
   private cursor = 0;
 
   constructor(name: string, capacity: number, texture: Texture, tint: readonly [number, number, number, number]) {
     this.capacity = capacity;
+    this.defaultTint = tint;
     this.geometry = new InstancedBufferGeometry();
     this.geometry.setAttribute(
       "position",
@@ -1096,11 +1113,12 @@ class ParticleQuadBatch {
     this.geometry.setAttribute("aRotation", this.rotation);
     this.geometry.setAttribute("aPivot", this.pivot);
     this.geometry.setAttribute("aMaxParticleSize", this.maxParticleSize);
+    this.tint = new InstancedBufferAttribute(new Float32Array(capacity * 4), 4).setUsage(DynamicDrawUsage);
+    this.geometry.setAttribute("aTint", this.tint);
     this.geometry.instanceCount = 0;
     this.material = new ShaderMaterial({
       uniforms: {
         uMap: { value: texture },
-        uTintColor: { value: new Vector4(...tint) },
       },
       vertexShader: `
         attribute vec3 aCenter;
@@ -1109,7 +1127,8 @@ class ParticleQuadBatch {
         attribute float aRotation;
         attribute vec2 aPivot;
         attribute float aMaxParticleSize;
-        uniform vec4 uTintColor;
+        attribute vec4 aTint;
+
         varying vec2 vUv;
         varying vec4 vColor;
         void main() {
@@ -1122,8 +1141,8 @@ class ParticleQuadBatch {
           offset = mat2(cosine, -sine, sine, cosine) * offset;
           vUv = uv;
           // Compiled Custom/Mobile/MobileAddHdrColor GLES3 vertex program:
-          //     vs_COLOR0 = in_COLOR0 * _TintColor
-          vColor = aColor * uTintColor;
+          //     vs_COLOR0 = in_COLOR0 * _TintColor * _TintColor * 2
+          vColor = aColor * aTint * aTint * 2.0;
           // Every visible effect001 billboard ParticleSystemRenderer uses
           // RenderMode=VerticalBillboard. It stays upright in world Y while
           // its horizontal axis turns toward the live camera.
@@ -1151,7 +1170,7 @@ class ParticleQuadBatch {
       `,
       fragmentShader: `
         uniform sampler2D uMap;
-        uniform vec4 uTintColor;
+
         varying vec2 vUv;
         varying vec4 vColor;
         float roundEvenPositive(float value) {
@@ -1164,11 +1183,10 @@ class ParticleQuadBatch {
         void main() {
           vec4 texel = texture2D(uMap, vUv);
           // Compiled fragment program quantizes vertex alpha to Color32,
-          // doubles all channels, then applies _TintColor a second time.
+          // after the vertex stage has applied both tint factors and doubled it.
           vec4 hdrColor;
-          hdrColor.rgb = vColor.rgb * 2.0;
-          hdrColor.a = roundEvenPositive(clamp(vColor.a, 0.0, 1.0) * 255.0) * (2.0 / 255.0);
-          hdrColor *= uTintColor;
+          hdrColor.rgb = vColor.rgb;
+          hdrColor.a = roundEvenPositive(vColor.a * 255.0) / 255.0;
           float alpha = texel.a * hdrColor.a;
           gl_FragColor = vec4(texel.rgb * hdrColor.rgb, alpha);
         }
@@ -1213,6 +1231,7 @@ class ParticleQuadBatch {
     maxParticleSize = 1,
     pivotX = 0,
     pivotY = 0,
+    materialTint?: readonly [number, number, number, number],
   ): boolean {
     if (this.cursor >= this.capacity) return false;
     this.center.setXYZ(this.cursor, x, y, z);
@@ -1221,6 +1240,7 @@ class ParticleQuadBatch {
     this.rotation.setX(this.cursor, rotation);
     this.maxParticleSize.setX(this.cursor, maxParticleSize);
     this.pivot.setXY(this.cursor, pivotX, pivotY);
+    this.tint.setXYZW(this.cursor, ...(materialTint ?? this.defaultTint));
     this.cursor += 1;
     return true;
   }
@@ -1232,18 +1252,21 @@ class ParticleQuadBatch {
     this.center.clearUpdateRanges();
     this.size.clearUpdateRanges();
     this.color.clearUpdateRanges();
+    this.tint.clearUpdateRanges();
     this.rotation.clearUpdateRanges();
     this.pivot.clearUpdateRanges();
     this.maxParticleSize.clearUpdateRanges();
     this.center.addUpdateRange(0, this.cursor * 3);
     this.size.addUpdateRange(0, this.cursor * 2);
     this.color.addUpdateRange(0, this.cursor * 4);
+    this.tint.addUpdateRange(0, this.cursor * 4);
     this.rotation.addUpdateRange(0, this.cursor);
     this.pivot.addUpdateRange(0, this.cursor * 2);
     this.maxParticleSize.addUpdateRange(0, this.cursor);
     this.center.needsUpdate = true;
     this.size.needsUpdate = true;
     this.color.needsUpdate = true;
+    this.tint.needsUpdate = true;
     this.rotation.needsUpdate = true;
     this.pivot.needsUpdate = true;
     this.maxParticleSize.needsUpdate = true;
@@ -1273,6 +1296,8 @@ class EffectMeshBatch {
   private readonly scale: InstancedBufferAttribute;
   private readonly color: InstancedBufferAttribute;
   private readonly rotationX: InstancedBufferAttribute;
+  private readonly tint: InstancedBufferAttribute;
+  private readonly defaultTint: readonly [number, number, number, number];
   private readonly capacity: number;
   private cursor = 0;
 
@@ -1289,6 +1314,7 @@ class EffectMeshBatch {
     shaderMode: EffectMeshShaderMode = "mobileAddHdr",
   ) {
     this.capacity = capacity;
+    this.defaultTint = tint;
     this.geometry = new InstancedBufferGeometry();
     const position = source.getAttribute("position");
     const uv = source.getAttribute("uv");
@@ -1303,11 +1329,12 @@ class EffectMeshBatch {
     this.geometry.setAttribute("aScale", this.scale);
     this.geometry.setAttribute("aColor", this.color);
     this.geometry.setAttribute("aRotationX", this.rotationX);
+    this.tint = new InstancedBufferAttribute(new Float32Array(capacity * 4), 4).setUsage(DynamicDrawUsage);
+    this.geometry.setAttribute("aTint", this.tint);
     this.geometry.instanceCount = 0;
     this.material = new ShaderMaterial({
       uniforms: {
         uMap: { value: texture },
-        uTintColor: { value: new Vector4(...tint) },
         uSliceBorder: { value: new Vector2(...(sliceBorder ?? [0, 0])) },
         uSliced: { value: sliceBorder ? 1 : 0 },
         uMeshPivot: { value: new Vector3(...meshPivot) },
@@ -1317,7 +1344,8 @@ class EffectMeshBatch {
         attribute vec3 aScale;
         attribute vec4 aColor;
         attribute float aRotationX;
-        uniform vec4 uTintColor;
+        attribute vec4 aTint;
+
         uniform vec2 uSliceBorder;
         uniform float uSliced;
         uniform vec3 uMeshPivot;
@@ -1348,7 +1376,7 @@ class EffectMeshBatch {
           float sine = sin(aRotationX);
           offset.yz = mat2(cosine, sine, -sine, cosine) * offset.yz;
           vUv = uv;
-          vColor = aColor * uTintColor;
+          vColor = ${shaderMode === "uiAdditive" ? "aColor * aTint" : "aColor * aTint * aTint * 2.0"};
           gl_Position = projectionMatrix * modelViewMatrix * vec4(aCenter + offset, 1.0);
         }
       `,
@@ -1367,7 +1395,7 @@ class EffectMeshBatch {
           `
           : `
             uniform sampler2D uMap;
-            uniform vec4 uTintColor;
+
             varying vec2 vUv;
             varying vec4 vColor;
             float roundEvenPositive(float value) {
@@ -1380,9 +1408,8 @@ class EffectMeshBatch {
             void main() {
               vec4 texel = texture2D(uMap, vUv);
               vec4 hdrColor;
-              hdrColor.rgb = vColor.rgb * 2.0;
-              hdrColor.a = roundEvenPositive(clamp(vColor.a, 0.0, 1.0) * 255.0) * (2.0 / 255.0);
-              hdrColor *= uTintColor;
+              hdrColor.rgb = vColor.rgb;
+              hdrColor.a = roundEvenPositive(vColor.a * 255.0) / 255.0;
               float alpha = texel.a * hdrColor.a;
               gl_FragColor = vec4(texel.rgb * hdrColor.rgb, alpha);
             }
@@ -1426,12 +1453,14 @@ class EffectMeshBatch {
     blue: number,
     alpha: number,
     rotationX = 0,
+    materialTint?: readonly [number, number, number, number],
   ): boolean {
     if (this.cursor >= this.capacity) return false;
     this.center.setXYZ(this.cursor, x, y, z);
     this.scale.setXYZ(this.cursor, scaleX, scaleY, scaleZ);
     this.color.setXYZW(this.cursor, red, green, blue, alpha);
     this.rotationX.setX(this.cursor, rotationX);
+    this.tint.setXYZW(this.cursor, ...(materialTint ?? this.defaultTint));
     this.cursor += 1;
     return true;
   }
@@ -1443,14 +1472,17 @@ class EffectMeshBatch {
     this.center.clearUpdateRanges();
     this.scale.clearUpdateRanges();
     this.color.clearUpdateRanges();
+    this.tint.clearUpdateRanges();
     this.rotationX.clearUpdateRanges();
     this.center.addUpdateRange(0, this.cursor * 3);
     this.scale.addUpdateRange(0, this.cursor * 3);
     this.color.addUpdateRange(0, this.cursor * 4);
+    this.tint.addUpdateRange(0, this.cursor * 4);
     this.rotationX.addUpdateRange(0, this.cursor);
     this.center.needsUpdate = true;
     this.scale.needsUpdate = true;
     this.color.needsUpdate = true;
+    this.tint.needsUpdate = true;
     this.rotationX.needsUpdate = true;
   }
 
@@ -2915,6 +2947,7 @@ export class ParticleLayer {
             system.ref.rendererMaxParticleSize,
             pivotX,
             pivotY,
+            system.ref.materialTint,
           );
           this.traceSink?.billboard({
             texture: system.ref.texture,
@@ -2922,6 +2955,7 @@ export class ParticleLayer {
             emission: emission.index,
             particleSeed: systemSeed ^ Math.imul(emission.index + 1, 0x9e3779b9),
             simulationSpeed: system.simulationSpeed,
+            materialTint: system.ref.materialTint,
             age: sample.age,
             lifetime: sample.lifetime,
             x: worldX,
@@ -3070,7 +3104,20 @@ export class ParticleLayer {
       const red = clipBindingValue(animation, path, SPRITE_COLOR_ATTRIBUTES[0]!, animationTime) ?? spec.baseColor[0];
       const green = clipBindingValue(animation, path, SPRITE_COLOR_ATTRIBUTES[1]!, animationTime) ?? spec.baseColor[1];
       const blue = clipBindingValue(animation, path, SPRITE_COLOR_ATTRIBUTES[2]!, animationTime) ?? spec.baseColor[2];
-      batch.push(spriteX, spriteY, spriteZ, scaleX, scaleY, spec.localScale[2], red, green, blue, alpha, rotationX);
+      batch.push(
+        spriteX,
+        spriteY,
+        spriteZ,
+        scaleX,
+        scaleY,
+        spec.localScale[2],
+        red,
+        green,
+        blue,
+        alpha,
+        rotationX,
+        spec.materialTint,
+      );
       this.traceSink?.mesh({
         kind: name === "frame" ? "frame" : "pillar",
         name,
@@ -3082,6 +3129,7 @@ export class ParticleLayer {
         scaleZ: spec.localScale[2],
         color: { r: red, g: green, b: blue, a: alpha },
         rotationX,
+        materialTint: spec.materialTint,
       });
     }
     const wallSystem = loaded?.wallSystem;
@@ -3138,6 +3186,8 @@ export class ParticleLayer {
         sample.color.g,
         sample.color.b,
         sample.color.a,
+        0,
+        wallSystem.ref.materialTint,
       );
       this.traceSink?.mesh({
         kind: "wall",
@@ -3150,6 +3200,7 @@ export class ParticleLayer {
         scaleZ: sample.sizeZ,
         color: { ...sample.color },
         rotationX: 0,
+        materialTint: wallSystem.ref.materialTint,
       });
       break;
     }
@@ -3169,7 +3220,7 @@ export class ParticleLayer {
   ): ParticleEmission[] {
     if (
       !this.incrementalEmissions ||
-      system.ref.animationPath ||
+      (system.ref.animationPath && (!prefab.manifest.loopAnimation || animationTimeOffset !== 0)) ||
       simulationClock ||
       !supportsIncrementalRateEmission(system, seed)
     ) {

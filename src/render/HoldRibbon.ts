@@ -149,7 +149,10 @@ function makeFallbackTexture(hasAuthoredTexture: boolean): DataTexture {
   return texture;
 }
 
-function resolveStyle(style: OurNotesSlideLineStyle, noteSkin: OurNotesAssetManifest["source"]["noteSkin"]): ResolvedSlideLineStyle {
+function resolveStyle(
+  style: OurNotesSlideLineStyle,
+  noteSkin: OurNotesAssetManifest["source"]["noteSkin"],
+): ResolvedSlideLineStyle {
   const native = style as NativeSlideLineStyle;
   return {
     ...style,
@@ -677,26 +680,29 @@ export class HoldRibbonLayer {
     const outerLeft = Math.min(projectedLeft, projectedRight);
     const outerRight = Math.max(projectedLeft, projectedRight);
     const glowHalfWidth = Math.min(
-      viewProgress * this.style.glowRangeScale / 2,
+      (viewProgress * this.style.glowRangeScale) / 2,
       Math.max(outerRight - outerLeft, 0) / 2,
     );
+    // NoteLineTrapezoidCalculator clips each column against the same
+    // progress-scaled lane boundaries. Preserve the unclipped glow width so
+    // a cut border narrows its UV interval along with its geometry.
+    const laneLeft = this.projector.laneEdgeToXAtViewProgress(0, viewProgress);
+    const laneRight = this.projector.laneEdgeToXAtViewProgress(this.projector.laneCount, viewProgress);
     const columns = [
-      outerLeft,
-      clamp(outerLeft + glowHalfWidth, outerLeft, outerRight),
-      clamp(outerRight - glowHalfWidth, outerLeft, outerRight),
-      outerRight,
+      clamp(outerLeft, laneLeft, laneRight),
+      clamp(outerLeft + glowHalfWidth, laneLeft, laneRight),
+      clamp(outerRight - glowHalfWidth, laneLeft, laneRight),
+      clamp(outerRight, laneLeft, laneRight),
     ];
     const leftBorderWidth = columns[1]! - columns[0]!;
     const rightBorderWidth = columns[3]! - columns[2]!;
-    const leftUvAmount = glowHalfWidth > NATIVE_EPSILON ? clamp01(leftBorderWidth / glowHalfWidth) : 0;
-    const rightUvAmount = glowHalfWidth > NATIVE_EPSILON ? clamp01(rightBorderWidth / glowHalfWidth) : 0;
+    const leftUvAmount = glowHalfWidth >= 1e-6 ? clamp01(leftBorderWidth / glowHalfWidth) : 0;
+    const rightUvAmount = glowHalfWidth >= 1e-6 ? clamp01(rightBorderWidth / glowHalfWidth) : 0;
     const leftInnerU = 0.5 + (0.125 - 0.5) * leftUvAmount;
     const rightInnerU = 0.5 + (0.875 - 0.5) * rightUvAmount;
-    const y = this.projector.yAtViewProgress(viewProgress) + 0.002;
+    const y = this.projector.yAtViewProgress(viewProgress);
     const z = 0;
-    const fade = approach <= 1 || NATIVE_FADE_RANGE <= 0
-      ? 1
-      : 1 - clamp01((approach - 1) / NATIVE_FADE_RANGE);
+    const fade = approach <= 1 || NATIVE_FADE_RANGE <= 0 ? 1 : 1 - clamp01((approach - 1) / NATIVE_FADE_RANGE);
     const alpha = opacity * fade;
     for (let column = 0; column < RIBBON_COLUMNS; column += 1) {
       const vertex = sampleIndex * RIBBON_COLUMNS + column;
@@ -707,8 +713,8 @@ export class HoldRibbonLayer {
       const leftBorder = column < 2;
       const referenceLeft = leftBorder ? columns[0]! : columns[2]!;
       const referenceRight = leftBorder ? columns[1]! : columns[3]!;
-      const textureLeft = leftBorder ? 0 : rightInnerU;
-      const textureRight = leftBorder ? leftInnerU : 1;
+      const textureLeft = leftBorder ? 0.5 * (1 - leftUvAmount) : rightInnerU;
+      const textureRight = leftBorder ? leftInnerU : 0.5 + 0.5 * rightUvAmount;
       visual.positions[positionOffset] = columns[column]!;
       visual.positions[positionOffset + 1] = y;
       visual.positions[positionOffset + 2] = z;
