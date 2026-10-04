@@ -3,6 +3,7 @@ import {
   Color,
   Group,
   PerspectiveCamera,
+  Raycaster,
   Scene,
   SRGBColorSpace,
   TextureLoader,
@@ -23,10 +24,20 @@ import { ParticleLayer } from "./ParticleLayer";
 import { SimultaneousLineLayer } from "./SimultaneousLineLayer";
 import { OurNotesStage, ScreenLaneBackdrop, StageProjector } from "./stageGeometry";
 import {
+  nativeNoteViewAtCanvasPoint,
+  projectNativeNoteView,
+  type NativeChartPresentation,
+  type NativeChartViewport,
+  type NativeNoteHit,
+  type NativeNoteViewPoint,
+  type NativeNoteViewProjection,
+} from "./presentation";
+import {
   isRenderLaneEffectKind,
   type OurNotesRendererOptions as PortableRendererOptions,
   type OurNotesRendererStats,
   type RenderFrame,
+  type RenderNote,
 } from "@haneoka/cassiopeia-plugin-our-notes";
 
 export type OurNotesRendererOptions = PortableRendererOptions<HTMLCanvasElement>;
@@ -73,7 +84,7 @@ export function configureOurNotesCamera(camera: PerspectiveCamera): PerspectiveC
  * Rendering adapter for the original Our Notes live scene. Simulation and
  * judgement stay outside Three.js and enter as synchronously consumed RenderFrame DTOs.
  */
-export class OurNotesRenderer {
+export class OurNotesRenderer implements NativeChartPresentation {
   readonly scene = new Scene();
   readonly camera: PerspectiveCamera;
   readonly projector: StageProjector;
@@ -112,6 +123,8 @@ export class OurNotesRenderer {
   private laneProjectionLeftNdcX = -1;
   private laneProjectionRightNdcX = 1;
   private readonly drawingBufferSize = new Vector2();
+  private readonly noteRaycaster = new Raycaster();
+  private readonly notePointer = new Vector2();
   private lastEffectFrame = -1;
   private effectCacheActive = false;
   private particleStateActive = false;
@@ -350,6 +363,19 @@ export class OurNotesRenderer {
 
   /** Convert DOM client coordinates to a half-lane, or -1 outside the judgement span. */
   clientPointToLane(clientX: number, clientY: number): number {
+    const point = this.clientPointOnCanvas(clientX, clientY);
+    return this.canvasPointToLane(point.x, point.y, point.width, point.height);
+  }
+
+  private clientPointOnCanvas(
+    clientX: number,
+    clientY: number,
+  ): {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+  } {
     const canvas = this.options.canvas;
     const rotationRoot = canvas.closest<HTMLElement>("[data-runtime-rotation]");
     const rotationHost = rotationRoot?.parentElement;
@@ -377,12 +403,57 @@ export class OurNotesRenderer {
           contentHeight: rotationRoot.clientHeight,
           angleRadians: angle,
         });
-        return this.canvasPointToLane(point.x - offsetX, point.y - offsetY, canvas.clientWidth, canvas.clientHeight);
+        return {
+          x: point.x - offsetX,
+          y: point.y - offsetY,
+          width: canvas.clientWidth,
+          height: canvas.clientHeight,
+        };
       }
     }
 
     const rect = canvas.getBoundingClientRect();
-    return this.canvasPointToLane(clientX - rect.left, clientY - rect.top, rect.width, rect.height);
+    return { x: clientX - rect.left, y: clientY - rect.top, width: rect.width, height: rect.height };
+  }
+
+  getViewport(): NativeChartViewport | undefined {
+    if (this.disposed || !this.sized) return;
+    return { width: this.width, height: this.height, pixelRatio: this.pixelRatio, laneCount: this.projector.laneCount };
+  }
+
+  projectNoteView(note: Pick<RenderNote, "lane" | "width" | "approach">): NativeNoteViewProjection | undefined {
+    const viewport = this.getViewport();
+    if (!viewport) return;
+    return projectNativeNoteView(note, this.projector, viewport, this.camera.projectionMatrix.elements);
+  }
+
+  canvasPointToNoteView(x: number, y: number): NativeNoteViewPoint | undefined {
+    const viewport = this.getViewport();
+    if (!viewport) return;
+    return nativeNoteViewAtCanvasPoint(x, y, this.projector, viewport, this.camera.projectionMatrix.elements);
+  }
+
+  clientPointToNoteView(clientX: number, clientY: number): NativeNoteViewPoint | undefined {
+    if (this.disposed) return;
+    const point = this.clientPointOnCanvas(clientX, clientY);
+    if (point.width <= 0 || point.height <= 0) return;
+    return this.canvasPointToNoteView((point.x * this.width) / point.width, (point.y * this.height) / point.height);
+  }
+
+  pickNoteAtCanvasPoint(x: number, y: number): NativeNoteHit | undefined {
+    if (this.disposed || this.contextLost || !Number.isFinite(x) || !Number.isFinite(y)) return;
+    if (x < 0 || y < 0 || x > this.width || y > this.height) return;
+    this.notePointer.set((2 * x) / this.width - 1, 1 - (2 * y) / this.height);
+    this.camera.updateMatrixWorld(true);
+    this.noteRaycaster.setFromCamera(this.notePointer, this.camera);
+    return this.notes.pickNote(this.noteRaycaster);
+  }
+
+  pickNoteAtClientPoint(clientX: number, clientY: number): NativeNoteHit | undefined {
+    if (this.disposed) return;
+    const point = this.clientPointOnCanvas(clientX, clientY);
+    if (point.width <= 0 || point.height <= 0) return;
+    return this.pickNoteAtCanvasPoint((point.x * this.width) / point.width, (point.y * this.height) / point.height);
   }
 
   /** Convert CSS-pixel canvas coordinates to native continuous lane centres (0..23). */

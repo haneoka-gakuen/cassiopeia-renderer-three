@@ -14,6 +14,8 @@ import {
   PlaneGeometry,
   ShaderMaterial,
 } from "three";
+import type { Raycaster } from "three";
+import type { NativeNoteHit } from "./presentation";
 import { SpriteAtlas, type SpriteMesh, type SpriteRegion } from "../assets/SpriteAtlas";
 import { OUR_NOTES_LIVE_GEOMETRY, type OurNotesAssetManifest } from "@haneoka/cassiopeia-plugin-our-notes";
 import {
@@ -166,6 +168,33 @@ export class NoteLayer {
       if (visual.lastSeen !== epoch) this.releaseVisual(id, visual);
     }
     if (this.assets.arrowGradient) this.updateArrowGradient(timeSeconds);
+  }
+
+  /** Hit the currently displayed native sprite triangles, including flick arrows and marks. */
+  pickNote(raycaster: Raycaster): NativeNoteHit | undefined {
+    this.group.updateWorldMatrix(true, true);
+    let selected: NativeNoteHit | undefined;
+    let order = Number.NEGATIVE_INFINITY;
+    for (const [id, visual] of this.visuals) {
+      if (!visual.root.visible) continue;
+      const parts = [
+        [visual.body, "body"],
+        [visual.decoration, "mark"],
+        [visual.arrow, "arrow"],
+      ] as const;
+      for (const [mesh, part] of parts) {
+        if (!mesh?.visible || mesh.renderOrder < order) continue;
+        const opacity =
+          mesh.material instanceof ShaderMaterial
+            ? (mesh.material.uniforms.uOpacity?.value ?? 1)
+            : mesh.material.opacity;
+        if (opacity <= 0.001 || !mesh.material.colorWrite) continue;
+        if (raycaster.intersectObject(mesh, false).length === 0) continue;
+        selected = { id, part };
+        order = mesh.renderOrder;
+      }
+    }
+    return selected;
   }
 
   /** Each ArrowGradientAnimator starts its sweep when its note view is acquired. */
@@ -736,6 +765,8 @@ export class NoteLayer {
           }
         });
         visual.bodyPositions.needsUpdate = true;
+        // Mesh.raycast uses this bound; a previous width must not hide a resized note.
+        visual.body.geometry.boundingSphere = null;
       }
 
       visual.layoutWidth = note.width;

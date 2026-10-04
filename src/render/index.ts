@@ -9,4 +9,5 @@ export * from "./LiveUrpBloom";
 export * from "./PerfProbe";
 export * from "./SimultaneousLineLayer";
 export * from "./stageGeometry";
+export * from "./presentation";
 export * from "@haneoka/cassiopeia-plugin-our-notes";

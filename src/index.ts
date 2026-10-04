@@ -13,4 +13,5 @@ export * from "./render/backgroundMedia";
 export * from "./render/noteSkinLayout";
 export * from "./render/pixelRatio";
 export * from "./render/stageGeometry";
+export * from "./render/presentation";
 export * from "./plugin";
