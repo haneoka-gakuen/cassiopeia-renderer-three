@@ -173,6 +173,8 @@ export interface NativeBillboardTrace {
   color: Readonly<NativeColor>;
   rotation: number;
   maxParticleSize: number;
+  /** Unity billboard mode; omitted retains the established vertical renderer. */
+  renderMode?: 0 | 2 | 3;
   pivotX: number;
   pivotY: number;
 }
@@ -1086,6 +1088,7 @@ class ParticleQuadBatch {
   private readonly rotation: InstancedBufferAttribute;
   private readonly pivot: InstancedBufferAttribute;
   private readonly maxParticleSize: InstancedBufferAttribute;
+  private readonly renderMode: InstancedBufferAttribute;
   private readonly tint: InstancedBufferAttribute;
   private readonly defaultTint: readonly [number, number, number, number];
   private readonly capacity: number;
@@ -1107,12 +1110,14 @@ class ParticleQuadBatch {
     this.rotation = new InstancedBufferAttribute(new Float32Array(capacity), 1).setUsage(DynamicDrawUsage);
     this.pivot = new InstancedBufferAttribute(new Float32Array(capacity * 2), 2).setUsage(DynamicDrawUsage);
     this.maxParticleSize = new InstancedBufferAttribute(new Float32Array(capacity), 1).setUsage(DynamicDrawUsage);
+    this.renderMode = new InstancedBufferAttribute(new Float32Array(capacity), 1).setUsage(DynamicDrawUsage);
     this.geometry.setAttribute("aCenter", this.center);
     this.geometry.setAttribute("aSize", this.size);
     this.geometry.setAttribute("aColor", this.color);
     this.geometry.setAttribute("aRotation", this.rotation);
     this.geometry.setAttribute("aPivot", this.pivot);
     this.geometry.setAttribute("aMaxParticleSize", this.maxParticleSize);
+    this.geometry.setAttribute("aRenderMode", this.renderMode);
     this.tint = new InstancedBufferAttribute(new Float32Array(capacity * 4), 4).setUsage(DynamicDrawUsage);
     this.geometry.setAttribute("aTint", this.tint);
     this.geometry.instanceCount = 0;
@@ -1127,6 +1132,7 @@ class ParticleQuadBatch {
         attribute float aRotation;
         attribute vec2 aPivot;
         attribute float aMaxParticleSize;
+        attribute float aRenderMode;
         attribute vec4 aTint;
 
         varying vec2 vUv;
@@ -1143,15 +1149,21 @@ class ParticleQuadBatch {
           // Compiled Custom/Mobile/MobileAddHdrColor GLES3 vertex program:
           //     vs_COLOR0 = in_COLOR0 * _TintColor * _TintColor * 2
           vColor = aColor * aTint * aTint * 2.0;
-          // Every visible effect001 billboard ParticleSystemRenderer uses
-          // RenderMode=VerticalBillboard. It stays upright in world Y while
-          // its horizontal axis turns toward the live camera.
+          // Unity billboard modes use camera axes, the world XZ plane, or
+          // an upright world-Y quad turning horizontally towards the camera.
           vec4 worldCenter = modelMatrix * vec4(aCenter, 1.0);
           vec3 toCamera = cameraPosition - worldCenter.xyz;
           vec2 horizontal = toCamera.xz;
           float horizontalLength = max(length(horizontal), 0.000001);
           vec3 right = vec3(horizontal.y, 0.0, -horizontal.x) / horizontalLength;
           vec3 up = vec3(0.0, 1.0, 0.0);
+          if (aRenderMode < 0.5) {
+            right = vec3(viewMatrix[0][0], viewMatrix[1][0], viewMatrix[2][0]);
+            up = vec3(viewMatrix[0][1], viewMatrix[1][1], viewMatrix[2][1]);
+          } else if (aRenderMode < 2.5) {
+            right = vec3(1.0, 0.0, 0.0);
+            up = vec3(0.0, 0.0, -1.0);
+          }
           // Clamp size at the particle centre, before the pivot offset.
           // Projecting the unbounded/pivot-shifted corners first can cross
           // the near plane and collapse a large beam almost to zero. The
@@ -1232,6 +1244,7 @@ class ParticleQuadBatch {
     pivotX = 0,
     pivotY = 0,
     materialTint?: readonly [number, number, number, number],
+    renderMode: 0 | 2 | 3 = 3,
   ): boolean {
     if (this.cursor >= this.capacity) return false;
     this.center.setXYZ(this.cursor, x, y, z);
@@ -1239,6 +1252,7 @@ class ParticleQuadBatch {
     this.color.setXYZW(this.cursor, color.r, color.g, color.b, color.a);
     this.rotation.setX(this.cursor, rotation);
     this.maxParticleSize.setX(this.cursor, maxParticleSize);
+    this.renderMode.setX(this.cursor, renderMode);
     this.pivot.setXY(this.cursor, pivotX, pivotY);
     this.tint.setXYZW(this.cursor, ...(materialTint ?? this.defaultTint));
     this.cursor += 1;
@@ -1256,6 +1270,7 @@ class ParticleQuadBatch {
     this.rotation.clearUpdateRanges();
     this.pivot.clearUpdateRanges();
     this.maxParticleSize.clearUpdateRanges();
+    this.renderMode.clearUpdateRanges();
     this.center.addUpdateRange(0, this.cursor * 3);
     this.size.addUpdateRange(0, this.cursor * 2);
     this.color.addUpdateRange(0, this.cursor * 4);
@@ -1263,6 +1278,7 @@ class ParticleQuadBatch {
     this.rotation.addUpdateRange(0, this.cursor);
     this.pivot.addUpdateRange(0, this.cursor * 2);
     this.maxParticleSize.addUpdateRange(0, this.cursor);
+    this.renderMode.addUpdateRange(0, this.cursor);
     this.center.needsUpdate = true;
     this.size.needsUpdate = true;
     this.color.needsUpdate = true;
@@ -1270,6 +1286,7 @@ class ParticleQuadBatch {
     this.rotation.needsUpdate = true;
     this.pivot.needsUpdate = true;
     this.maxParticleSize.needsUpdate = true;
+    this.renderMode.needsUpdate = true;
   }
 
   setTexture(texture: Texture): void {
@@ -1571,9 +1588,8 @@ export interface NativeWorldQuad {
 }
 
 /**
- * TypeScript mirror of the ParticleQuadBatch vertex shader: a vertical
- * billboard facing `cameraPosition` horizontally, with the renderer pivot and
- * the max-particle-size clamp evaluated at the particle centre.
+ * TypeScript mirror of the ParticleQuadBatch vertex shader for Unity View,
+ * Horizontal and Vertical billboards, with pivot and max-size clamp at centre.
  */
 export function nativeBillboardQuad(
   trace: NativeBillboardTrace,
@@ -1587,6 +1603,9 @@ export function nativeBillboardQuad(
   const rightX = toCameraZ / horizontalLength;
   const rightZ = -toCameraX / horizontalLength;
   const e = viewMatrix.elements;
+  const mode = trace.renderMode ?? 3;
+  const right = mode === 0 ? [e[0]!, e[4]!, e[8]!] : mode === 2 ? [1, 0, 0] : [rightX, 0, rightZ];
+  const up = mode === 0 ? [e[1]!, e[5]!, e[9]!] : mode === 2 ? [0, 0, -1] : [0, 1, 0];
   const viewZ = e[2]! * trace.x + e[6]! * trace.y + e[10]! * trace.z + e[14]!;
   const diameter = Math.max(Math.abs(trace.sizeX), Math.abs(trace.sizeY));
   const screenExtent = (diameter * Math.abs(projectionScaleY)) / (2 * Math.max(Math.abs(viewZ), 0.000001));
@@ -1600,7 +1619,11 @@ export function nativeBillboardQuad(
     // GLSL mat2(c, -s, s, c) * v is column-major: (c*x + s*y, -s*x + c*y).
     const rx = (cosine * ox + sine * oy) * particleScale;
     const ry = (-sine * ox + cosine * oy) * particleScale;
-    return new Vector3(trace.x + rightX * rx, trace.y + ry, trace.z + rightZ * rx);
+    return new Vector3(
+      trace.x + right[0]! * rx + up[0]! * ry,
+      trace.y + right[1]! * rx + up[1]! * ry,
+      trace.z + right[2]! * rx + up[2]! * ry,
+    );
   };
   return {
     corners: [corner(-0.5, -0.5), corner(0.5, -0.5), corner(0.5, 0.5), corner(-0.5, 0.5)],
@@ -2948,6 +2971,7 @@ export class ParticleLayer {
             pivotX,
             pivotY,
             system.ref.materialTint,
+            system.ref.rendererRenderMode,
           );
           this.traceSink?.billboard({
             texture: system.ref.texture,
@@ -2966,6 +2990,7 @@ export class ParticleLayer {
             color: { ...sample.color },
             rotation,
             maxParticleSize: system.ref.rendererMaxParticleSize,
+            renderMode: system.ref.rendererRenderMode,
             pivotX,
             pivotY,
           });
