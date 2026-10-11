@@ -48,5 +48,16 @@
     "node": ">=24"
   },
   "packageManager": "pnpm@11.14.0",
-  "description": "Three.js renderer for Cassiopeia rhythm-game frames"
+  "description": "Three.js renderer for Cassiopeia rhythm-game frames",
+  "keywords": [
+    "cassiopeia",
+    "rhythm-game",
+    "threejs",
+    "webgl",
+    "renderer"
+  ],
+  "homepage": "https://github.com/haneoka-gakuen/cassiopeia-renderer-three#readme",
+  "bugs": {
+    "url": "https://github.com/haneoka-gakuen/cassiopeia-renderer-three/issues"
+  }
 }
