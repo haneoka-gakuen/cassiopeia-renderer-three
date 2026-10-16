@@ -1,7 +1,14 @@
+import type { NativeIntroAssembly } from "./NativeIntroAssembler";
 import {
   CanvasTexture,
   Color,
   Group,
+  Mesh,
+  MeshBasicMaterial,
+  Matrix4,
+  NoColorSpace,
+  ShaderMaterial,
+  Texture,
   PerspectiveCamera,
   Raycaster,
   Scene,
@@ -12,15 +19,16 @@ import {
   VideoTexture,
   WebGLRenderer,
 } from "three";
-import type { Texture } from "three";
+import type { Object3D, WebGLRenderTarget } from "three";
 import { OUR_NOTES_LIVE_GEOMETRY } from "@haneoka/cassiopeia-plugin-our-notes";
 import { SpriteAtlas } from "../assets/SpriteAtlas";
 import { dynamicCanvasFrameChanged, refreshDynamicCanvasTexture } from "./backgroundMedia";
 import { HoldRibbonLayer } from "./HoldRibbon";
 import { HudLayer } from "./HudLayer";
-import { liveEffectFrameAction, LiveUrpBloomPipeline, liveEffectFrameIndex } from "./LiveUrpBloom";
+import { liveEffectFrameAction, LiveUrpBloomPipeline, LiveGameCompositor, liveEffectFrameIndex } from "./LiveUrpBloom";
 import { NoteLayer } from "./NoteLayer";
 import { ParticleLayer } from "./ParticleLayer";
+import { OverlayLayer } from "./OverlayLayer";
 import { SimultaneousLineLayer } from "./SimultaneousLineLayer";
 import { OurNotesStage, ScreenLaneBackdrop, StageProjector } from "./stageGeometry";
 import {
@@ -86,6 +94,13 @@ export function configureOurNotesCamera(camera: PerspectiveCamera): PerspectiveC
  */
 export class OurNotesRenderer implements NativeChartPresentation {
   readonly scene = new Scene();
+  private nativeIntro?: NativeIntroAssembly;
+  private nativeIntroActive = false;
+  private nativeIntroSeconds = 0;
+  private nativeIntroLaneVisible = true;
+  private nativeTapFadeDuration?: number;
+  private nativeTapFadeStart?: number;
+  private nativeTapFadeReserved = false;
   readonly camera: PerspectiveCamera;
   readonly projector: StageProjector;
   readonly renderer: WebGLRenderer;
@@ -98,8 +113,30 @@ export class OurNotesRenderer implements NativeChartPresentation {
   private readonly simultaneousLines: SimultaneousLineLayer;
   private readonly notes: NoteLayer;
   private readonly particles: ParticleLayer;
+  private readonly overlays = new OverlayLayer();
+  private readonly overlayProjection = new Matrix4();
+  private readonly stageCoordinateReflection = new Matrix4().makeScale(1, 1, -1);
   private readonly effectScene = new Scene();
   private readonly liveBloom: LiveUrpBloomPipeline;
+  private readonly gameCompositor = new LiveGameCompositor();
+  private readonly gammaMaterials = new WeakSet<MeshBasicMaterial>();
+  private readonly gammaTextures = new WeakSet<Texture>();
+  private readonly onNoteVisualAdded = (event: { child: Object3D }): void => {
+    this.configureGammaMaterials(event.child);
+  };
+  private readonly drawEffectScene = (): void => this.renderer.render(this.effectScene, this.camera);
+  private readonly drawGameScene = (): void => {
+    this.renderer.render(this.screenLane.scene, this.screenLane.camera);
+    this.renderer.clearDepth();
+    this.renderer.render(this.scene, this.camera);
+  };
+  private readonly drawMainBackground = (): void =>
+    this.renderer.render(this.screenLane.backgroundScene, this.screenLane.camera);
+  private readonly compositeEffects = (target: WebGLRenderTarget): void =>
+    this.liveBloom.composite(this.renderer, target);
+  private readonly drawMainUnderlays = (): void => {
+    if (this.overlays.underlayCount) this.renderer.render(this.overlays.underlay, this.overlays.screenCamera);
+  };
   private readonly screenRoot = new Group();
   private readonly hud?: HudLayer;
   private atlas?: SpriteAtlas;
@@ -147,7 +184,7 @@ export class OurNotesRenderer implements NativeChartPresentation {
   constructor(options: OurNotesRendererOptions) {
     this.options = options;
     const assets = options.assets;
-    this.liveBloom = new LiveUrpBloomPipeline(assets.liveQuality?.effectRenderingScale);
+    this.liveBloom = new LiveUrpBloomPipeline(assets.liveQuality?.effectRenderingScale, assets.liveQuality?.quality);
     this.projector = new StageProjector({
       laneCount: options.laneCount,
       stageWidth: options.stageWidth,
@@ -172,7 +209,9 @@ export class OurNotesRenderer implements NativeChartPresentation {
 
     this.renderer = new WebGLRenderer({
       canvas: options.canvas,
-      antialias: options.antialias ?? true,
+      // The output framebuffer receives a full-screen copy only. Native game
+      // geometry has its own samples=0 target and effects use their FXAA pass.
+      antialias: options.antialias ?? false,
       alpha: options.alpha ?? true,
       powerPreference: "high-performance",
       premultipliedAlpha: true,
@@ -188,16 +227,21 @@ export class OurNotesRenderer implements NativeChartPresentation {
     this.holds = new HoldRibbonLayer(this.projector, assets);
     this.simultaneousLines = new SimultaneousLineLayer(this.projector);
     this.notes = new NoteLayer(this.projector, assets);
+    this.notes.group.addEventListener("childadded", this.onNoteVisualAdded);
+    this.configureGammaMaterials(this.stage.group);
+    // Lane tint is authored as native Gamma floats rather than a hex color.
+    this.configureGammaMaterials(this.screenLane.scene, false);
+    this.configureGammaMaterials(this.screenLane.backgroundScene);
     this.particles = new ParticleLayer(this.projector, assets, options.maxParticleEffects, options.particlesPerEffect);
     this.screenRoot.add(this.holds.group, this.simultaneousLines.group, this.notes.group);
-    this.scene.add(this.camera, this.stage.group, this.particles.laneInputGroup);
+    this.scene.add(this.camera, this.stage.group, this.particles.laneInputGroup, this.overlays.game);
     // LiveEffectCamera.asset is a separate layer-29 HDR camera with URP post
     // processing. Its Transform_131 is an identity child of LiveGameCamera,
     // so rendering the effectScene through this exact same camera preserves
     // the native view/projection without any screenshot-derived offset.
     // Keeping particles out of the layer-25 base scene prevents Bloom from
     // affecting the stage, notes, holds, WebGL background or HUD.
-    this.effectScene.add(this.particles.group);
+    this.effectScene.add(this.particles.group, this.overlays.effects);
     this.renderer.autoClear = false;
     if (options.hudCanvas) this.hud = new HudLayer(options.hudCanvas, assets);
 
@@ -223,10 +267,33 @@ export class OurNotesRenderer implements NativeChartPresentation {
     return error;
   }
 
+  /** Copy the current positive-Z stage-world projection into a caller-owned column-major matrix. */
+  copyStageWorldToClip(target: Float64Array): void {
+    if (target.length !== 16) throw new Error("Stage projection requires a 4x4 matrix");
+    this.camera.updateMatrixWorld(true);
+    this.overlayProjection
+      .multiplyMatrices(this.camera.projectionMatrix, this.camera.matrixWorldInverse)
+      .multiply(this.stageCoordinateReflection);
+    target.set(this.overlayProjection.elements);
+  }
+
+  /** A seek or presentation replacement may change geometry inside the same cached effect frame. */
+  invalidateEffectFrame(): void {
+    this.liveBloom.invalidate();
+    this.effectCacheActive = false;
+    this.lastEffectFrame = -1;
+  }
+
   /** Toggle the optional critical/ease-note mark treatment. Disabled by default. */
   setShowEaseNote(showEaseNote = false): void {
     if (this.disposed) return;
     this.notes.setShowEaseNote(showEaseNote);
+  }
+
+  async loadOverlayTextures(
+    manifest: Readonly<Record<string, import("@haneoka/cassiopeia-plugin-our-notes").RenderOverlayTexture>>,
+  ): Promise<void> {
+    await this.overlays.load(manifest);
   }
 
   private async loadAssets(): Promise<void> {
@@ -238,6 +305,8 @@ export class OurNotesRenderer implements NativeChartPresentation {
       this.holds.loadTexture(),
       this.particles.loadTextures(),
       this.hud?.loadAssets() ?? Promise.resolve(),
+      this.overlays.load(this.options.overlayTextures ?? {}),
+      this.hud?.loadOverlayFonts(this.options.overlayFonts ?? {}) ?? Promise.resolve(),
     ]);
     if (this.disposed) {
       if (results[0].status === "fulfilled") results[0].value.dispose();
@@ -247,11 +316,16 @@ export class OurNotesRenderer implements NativeChartPresentation {
       this.notes.setAtlas(undefined);
       this.atlas?.dispose();
       this.atlas = results[0].value;
+      this.configureGammaTexture(this.atlas.texture);
       this.notes.setAtlas(this.atlas);
     }
     for (const result of results) {
       if (result.status === "rejected") this.reportAssetError(result.reason);
     }
+    // Texture assignments complete asynchronously after constructor registration.
+    this.configureGammaMaterials(this.stage.group);
+    this.configureGammaMaterials(this.screenLane.scene, false);
+    this.configureGammaMaterials(this.screenLane.backgroundScene);
     this.assetsReady = true;
     // A paused frame may stay in one native 30-fps bucket while the decoded
     // effect assets arrive. Force that bucket to be rendered again.
@@ -259,57 +333,159 @@ export class OurNotesRenderer implements NativeChartPresentation {
     this.effectCacheActive = false;
   }
 
+  /** Native Gamma textures sample their stored bytes, including bilinear interpolation. */
+  private configureGammaTexture(texture: Texture | null | undefined): void {
+    if (!texture || this.gammaTextures.has(texture)) return;
+    this.gammaTextures.add(texture);
+    if (texture.colorSpace !== NoColorSpace) {
+      texture.colorSpace = NoColorSpace;
+      texture.needsUpdate = true;
+    }
+  }
+
+  /** Register only this player's materials; preserve each known tint's input domain. */
+  private configureGammaMaterials(root: Object3D, colorFromHex = true): void {
+    root.traverse((object) => {
+      if (!(object instanceof Mesh)) return;
+      const materials = Array.isArray(object.material) ? object.material : [object.material];
+      for (const material of materials) {
+        if (material instanceof MeshBasicMaterial) this.configureGammaTexture(material.map);
+        else if (material instanceof ShaderMaterial) {
+          for (const uniform of Object.values(material.uniforms)) {
+            if (uniform.value instanceof Texture) this.configureGammaTexture(uniform.value);
+          }
+        }
+        if (!(material instanceof MeshBasicMaterial) || this.gammaMaterials.has(material)) continue;
+        this.gammaMaterials.add(material);
+        // Three decodes hex inputs on construction. Native float tints already
+        // carry Gamma values; converting those would brighten the lane again.
+        if (colorFromHex) material.color.convertLinearToSRGB();
+        const previousCompile = material.onBeforeCompile;
+        const previousKey = material.customProgramCacheKey();
+        material.onBeforeCompile = (shader, renderer) => {
+          previousCompile.call(material, shader, renderer);
+          // Game materials now sample and blend in Gamma directly. The final
+          // screen copy also preserves those values without another encoding.
+          shader.fragmentShader = shader.fragmentShader.replace("#include <colorspace_fragment>", "");
+        };
+        material.customProgramCacheKey = () => `${previousKey}:our-notes-game-gamma-v2`;
+        material.needsUpdate = true;
+      }
+    });
+  }
+
+  configureNativeIntroTapFade(duration: number, ease: number): void {
+    if (!Number.isFinite(duration) || duration <= 0 || ease !== 2)
+      throw new Error("Unsupported original tap-area fade parameters");
+    this.nativeTapFadeDuration = duration;
+  }
+
+  attachNativeIntro(intro: NativeIntroAssembly): void {
+    this.nativeIntro?.dispose();
+    this.nativeIntro = intro;
+    this.scene.add(intro.game);
+    this.effectScene.add(intro.effects);
+    if (this.nativeTapFadeDuration === undefined) throw new Error("Original tap-area fade data missing");
+    this.nativeTapFadeReserved = true;
+    this.nativeTapFadeStart = undefined;
+    this.stage.setTapAnimationAlpha(0);
+    this.nativeIntroActive = true;
+    this.nativeIntroSeconds = 0;
+  }
+
+  sampleNativeIntro(seconds: number, bypass = false): void {
+    if (!this.nativeIntro) return;
+    this.camera.updateMatrixWorld(true);
+    if (bypass) this.nativeIntro.bypass(this.camera);
+    else this.nativeIntro.advance(seconds, this.camera);
+    if (bypass) {
+      this.nativeTapFadeReserved = false;
+      this.nativeTapFadeStart = undefined;
+      this.stage.setTapAnimationAlpha(1);
+    } else if (this.nativeTapFadeStart !== undefined) {
+      const age = Math.max(0, this.nativeIntro.evaluationSeconds - this.nativeTapFadeStart);
+      const progress = Math.min(1, age / this.nativeTapFadeDuration!);
+      this.stage.setTapAnimationAlpha(1 - Math.cos((progress * Math.PI) / 2));
+    }
+    this.nativeIntroSeconds = seconds;
+    this.nativeIntroActive = !bypass && seconds < this.nativeIntro.timeline.duration;
+  }
+
+  setNativeIntroLaneVisible(visible: boolean): void {
+    if (visible && !this.nativeIntroLaneVisible && this.nativeTapFadeReserved && this.nativeIntro) {
+      this.nativeTapFadeStart = this.nativeIntro.evaluationSeconds;
+      this.nativeTapFadeReserved = false;
+    }
+    this.nativeIntroLaneVisible = visible;
+  }
+
+  setNativeIntroBackgroundScale(scale: readonly [number, number, number]): void {
+    this.screenLane.setBackgroundScale(scale[0], scale[1]);
+  }
+
   render(frame: RenderFrame): void {
     if (this.disposed || this.contextLost) return;
     this.refreshBackgroundCanvas();
     this.renderer.info.reset();
     this.stage.update(frame.stage);
+    this.stage.group.visible = !this.nativeIntroActive || this.nativeIntroLaneVisible;
+    this.screenLane.scene.visible = !this.nativeIntroActive || this.nativeIntroLaneVisible;
+    this.screenRoot.visible = !this.nativeIntroActive;
     this.screenLane?.setOpacity(frame.stage?.laneOpacity ?? 1);
     this.screenLane?.setBackgroundBrightness(frame.stage?.backgroundBrightness ?? 0.7);
     this.holds.update(frame.holds, frame.time);
     this.simultaneousLines.update(frame.simultaneousLines);
     this.notes.update(frame.notes, frame.time);
     this.particles.updateLaneInput(frame.particles);
-    this.renderer.clear(true, true, true);
-    if (this.screenLane) {
-      this.renderer.render(this.screenLane.scene, this.screenLane.camera);
-      this.renderer.clearDepth();
-    }
-    this.renderer.render(this.scene, this.camera);
+    this.overlays.update(frame.overlays);
     const particleEffectCount = frame.particles?.length ?? 0;
     let noteParticleEffectCount = 0;
     for (const effect of frame.particles ?? []) if (!isRenderLaneEffectKind(effect.kind)) noteParticleEffectCount += 1;
     const effectAction = liveEffectFrameAction(
-      noteParticleEffectCount,
+      noteParticleEffectCount + this.overlays.effectsCount,
       this.particleStateActive,
       this.effectCacheActive,
       this.lastEffectFrame,
       frame.time,
     );
-    this.effectRefreshed = effectAction === "refresh";
-    if (effectAction === "refresh") {
-      const nativeEffectFrame = liveEffectFrameIndex(frame.time);
-      // MonoBehaviour_45 keeps the base camera at 60 fps but renders the HDR
-      // effect camera at 30. ParticleLayer samples absolute-age state, so
-      // duplicate 60-fps base ticks in one native bucket need neither another
-      // simulation pass nor another HDR render.
+    const introEffectFrame = liveEffectFrameIndex(this.nativeIntroSeconds);
+    const activeEffectAction = this.nativeIntroActive
+      ? introEffectFrame !== this.lastEffectFrame || !this.effectCacheActive
+        ? "refresh"
+        : "reuse"
+      : effectAction;
+    this.effectRefreshed = activeEffectAction === "refresh";
+    if (activeEffectAction === "refresh") {
+      const nativeEffectFrame = liveEffectFrameIndex(this.nativeIntroActive ? this.nativeIntroSeconds : frame.time);
+      // FullInitialize overrides the serialized effect camera rate to 60 fps.
+      // Absolute-age particles and the HDR output are reused within one such
+      // bucket; paused frames therefore preserve the finished effect image.
       this.particles.update(frame.particles);
       this.particleStateActive = true;
       this.camera.updateMatrixWorld(true);
-      this.liveBloom.renderEffect(this.renderer, () => this.renderer.render(this.effectScene, this.camera));
+      this.liveBloom.renderEffect(this.renderer, this.drawEffectScene);
       this.effectCacheActive = true;
       this.lastEffectFrame = nativeEffectFrame;
-      this.liveBloom.composite(this.renderer);
-    } else if (effectAction === "reuse") {
-      this.liveBloom.composite(this.renderer);
-    } else if (effectAction === "release") {
+    } else if (activeEffectAction === "release") {
       if (this.particleStateActive) this.particles.update(undefined);
       this.particleStateActive = false;
       this.liveBloom.invalidate();
       this.effectCacheActive = false;
       this.lastEffectFrame = -1;
     }
-    this.hud?.draw(frame.hud);
+    this.gameCompositor.renderGame(this.renderer, this.drawGameScene);
+    this.gameCompositor.renderMain(
+      this.renderer,
+      this.drawMainBackground,
+      this.compositeEffects,
+      this.drawMainUnderlays,
+    );
+    if (this.overlays.screenCount) {
+      this.renderer.clearDepth();
+      this.renderer.render(this.overlays.screen, this.overlays.screenCamera);
+    }
+    if (this.nativeIntroActive) this.hud?.drawIntroduction(frame.hud ?? {}, frame.overlayTexts);
+    else this.hud?.draw(frame.hud, frame.overlayTexts);
     let noteCount = 0;
     for (const note of frame.notes ?? []) if (note.visible !== false) noteCount += 1;
     let holdCount = 0;
@@ -355,6 +531,7 @@ export class OurNotesRenderer implements NativeChartPresentation {
     this.screenLane?.resize(this.width, this.height);
     this.renderer.getDrawingBufferSize(this.drawingBufferSize);
     this.liveBloom.setSize(this.drawingBufferSize.x, this.drawingBufferSize.y);
+    this.gameCompositor.setSize(this.drawingBufferSize.x, this.drawingBufferSize.y);
     this.effectCacheActive = false;
     this.lastEffectFrame = -1;
     this.particles.setPixelRatio(this.pixelRatio);
@@ -413,12 +590,22 @@ export class OurNotesRenderer implements NativeChartPresentation {
     }
 
     const rect = canvas.getBoundingClientRect();
-    return { x: clientX - rect.left, y: clientY - rect.top, width: rect.width, height: rect.height };
+    return {
+      x: clientX - rect.left,
+      y: clientY - rect.top,
+      width: rect.width,
+      height: rect.height,
+    };
   }
 
   getViewport(): NativeChartViewport | undefined {
     if (this.disposed || !this.sized) return;
-    return { width: this.width, height: this.height, pixelRatio: this.pixelRatio, laneCount: this.projector.laneCount };
+    return {
+      width: this.width,
+      height: this.height,
+      pixelRatio: this.pixelRatio,
+      laneCount: this.projector.laneCount,
+    };
   }
 
   projectNoteView(note: Pick<RenderNote, "lane" | "width" | "approach">): NativeNoteViewProjection | undefined {
@@ -516,7 +703,7 @@ export class OurNotesRenderer implements NativeChartPresentation {
       texture.dispose();
       return;
     }
-    texture.colorSpace = SRGBColorSpace;
+    this.configureGammaTexture(texture);
     texture.anisotropy = 4;
     texture.needsUpdate = true;
     const previous = this.backgroundTexture;
@@ -547,7 +734,7 @@ export class OurNotesRenderer implements NativeChartPresentation {
       return;
     }
     const texture = new VideoTexture(video);
-    texture.colorSpace = SRGBColorSpace;
+    this.configureGammaTexture(texture);
     texture.generateMipmaps = false;
     this.backgroundTexture = texture;
     this.screenLane.setBackgroundTexture(texture);
@@ -576,7 +763,7 @@ export class OurNotesRenderer implements NativeChartPresentation {
       return;
     }
     const texture = new CanvasTexture(canvas);
-    texture.colorSpace = SRGBColorSpace;
+    this.configureGammaTexture(texture);
     texture.generateMipmaps = false;
     this.backgroundCanvas = canvas;
     this.backgroundCanvasWidth = canvas.width;
@@ -635,11 +822,16 @@ export class OurNotesRenderer implements NativeChartPresentation {
     this.backgroundLoadRevision += 1;
     this.options.canvas.removeEventListener("webglcontextlost", this.onContextLost, false);
     this.options.canvas.removeEventListener("webglcontextrestored", this.onContextRestored, false);
+    this.notes.group.removeEventListener("childadded", this.onNoteVisualAdded);
     this.notes.dispose();
     this.simultaneousLines.dispose();
     this.holds.dispose();
     this.particles.dispose();
+    this.overlays.dispose();
+    this.nativeIntro?.dispose();
+    this.nativeIntro = undefined;
     this.liveBloom.dispose();
+    this.gameCompositor.dispose();
     this.stage.dispose();
     this.screenLane?.dispose();
     this.hud?.dispose();
@@ -655,6 +847,13 @@ export class OurNotesRenderer implements NativeChartPresentation {
     this.scene.clear();
     this.effectScene.clear();
     this.renderer.setAnimationLoop(null);
+    const context = this.renderer.getContext();
+    if (!context.isContextLost()) {
+      // A replacement renderer on this canvas creates typed-byte 3D placeholder textures.
+      // Restore their required unpack defaults after the final 2D upload of this owner.
+      context.pixelStorei(context.UNPACK_FLIP_Y_WEBGL, false);
+      context.pixelStorei(context.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+    }
     this.renderer.dispose();
   }
 }

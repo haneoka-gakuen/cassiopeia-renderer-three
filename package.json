@@ -11,7 +11,8 @@
   "files": [
     "dist",
     "LICENSE",
-    "README.md"
+    "README.md",
+    "THIRD_PARTY_NOTICES.md"
   ],
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -38,11 +39,11 @@
   },
   "devDependencies": {
     "@types/node": "^26.1.0",
-    "typescript": "^6.0.3",
-    "vite": "^7.3.6",
-    "three": "0.184.0",
     "@types/three": "^0.184.1",
-    "prettier": "3.7.4"
+    "prettier": "3.7.4",
+    "three": "0.184.0",
+    "typescript": "^6.0.3",
+    "vite": "^7.3.6"
   },
   "engines": {
     "node": ">=24"
@@ -59,5 +60,8 @@
   "homepage": "https://github.com/haneoka-gakuen/cassiopeia-renderer-three#readme",
   "bugs": {
     "url": "https://github.com/haneoka-gakuen/cassiopeia-renderer-three/issues"
+  },
+  "dependencies": {
+    "fast-png": "^8.0.0"
   }
 }

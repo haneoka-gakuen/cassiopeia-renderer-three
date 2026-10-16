@@ -19,6 +19,8 @@ export interface NoteSkinSpriteBounds {
   height: number;
   centerX: number;
   centerY: number;
+  /** Full Sprite width before atlas trimming, in world units. */
+  sourceWidth?: number;
 }
 
 export interface NoteSkinQuad {
@@ -192,7 +194,7 @@ export function selectFlatNoteSkinParts(kind: RenderNoteKind, skin: OurNotesNote
   };
 }
 
-/** Unity Sprite.get_bounds calculated from the packed tight textureRect. */
+/** Tight render bounds and the full width used to place native note caps. */
 export function noteSkinSpriteBounds(region: SpriteRegion): NoteSkinSpriteBounds {
   const rotated = region.packingRotation === 4;
   const pixelWidth = rotated ? region.rect.height : region.rect.width;
@@ -203,6 +205,7 @@ export function noteSkinSpriteBounds(region: SpriteRegion): NoteSkinSpriteBounds
     height: pixelHeight / ppu,
     centerX: (region.offset.x + pixelWidth / 2 - region.pivot.x * region.sourceSize.width) / ppu,
     centerY: (region.offset.y + pixelHeight / 2 - region.pivot.y * region.sourceSize.height) / ppu,
+    sourceWidth: region.sourceSize.width / ppu,
   };
 }
 
@@ -256,8 +259,8 @@ export function layoutNoteSkinBody(options: {
   scale: number;
 }): NoteSkinBodyLayout {
   const scale = Math.max(0, options.scale);
-  const leftWidth = options.leftBounds.width * scale;
-  const rightWidth = options.rightBounds.width * scale;
+  const leftWidth = (options.leftBounds.sourceWidth ?? options.leftBounds.width) * scale;
+  const rightWidth = (options.rightBounds.sourceWidth ?? options.rightBounds.width) * scale;
   const leftHeight = options.leftBounds.height * scale;
   const rightHeight = options.rightBounds.height * scale;
   const mainHeight = options.mainBounds.height * scale;

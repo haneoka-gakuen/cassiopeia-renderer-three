@@ -390,6 +390,25 @@ export class TmpSdfFont {
     return true;
   }
 
+  drawTextInRect(
+    context: CanvasRenderingContext2D,
+    text: string,
+    bounds: readonly [number, number, number, number],
+    options: TmpSdfTextOptions & { verticalAlign: "top" | "middle" | "bottom" },
+  ): boolean {
+    const [left, top, width, height] = bounds;
+    const scale = (options.fontSize / this.pointSize) * this.faceScale;
+    const textHeight = (this.ascentLine - this.descentLine) * scale;
+    const centerY =
+      options.verticalAlign === "top"
+        ? top + textHeight / 2
+        : options.verticalAlign === "bottom"
+          ? top + height - textHeight / 2
+          : top + height / 2;
+    const x = options.align === "right" ? left + width : options.align === "center" ? left + width / 2 : left;
+    return this.drawText(context, text, x, centerY, options);
+  }
+
   private layout(text: string, fontSize: number, characterSpacing: number): TextLayout | undefined {
     if (this.disposed || !Number.isFinite(fontSize) || fontSize <= 0) return undefined;
     const characters: PositionedCharacter[] = [];

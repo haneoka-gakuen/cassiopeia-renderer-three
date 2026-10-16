@@ -1,9 +1,11 @@
-import type { OurNotesAssetManifest } from "@haneoka/cassiopeia-plugin-our-notes";
+import type { OurNotesAssetManifest, HudSpriteGeometry } from "@haneoka/cassiopeia-plugin-our-notes";
 import { TmpSdfFont } from "./TmpSdfFont";
 import type {
   RenderHudState,
   RenderJudgementInstance,
   RenderTitleIntroductionTheme,
+  RenderOverlayText,
+  TmpSdfFontAssetManifest,
 } from "@haneoka/cassiopeia-plugin-our-notes";
 
 const EMPTY_HUD_STATE: Readonly<RenderHudState> = Object.freeze({});
@@ -48,17 +50,11 @@ const DEFAULT_TITLE_THEME: RenderTitleIntroductionTheme = {
   creditsColor: "#ffffff",
 };
 
-// UILiveNoteJudgeEffectView.Initialize assigns each Sprite and immediately
-// invokes Image.SetNativeSize(). The prefab's common 276x66 RectTransform is
-// therefore only an editor placeholder, not the runtime render size.
-const JUDGEMENT_NATIVE_SIZES = {
-  just: [346, 122],
-  perfect: [312, 78],
-  great: [233, 76],
-  good: [186, 76],
-  bad: [156, 80],
-  miss: [177, 76],
-} as const;
+// LiveJudgementView.Show writes the pooled instance to (0,-66). The prefab's
+// bottom-aligned VerticalLayoutGroup then puts main_judge at canvas Y=-136
+// and timing_offset at Y=-65, including UILiveJudgement and effect_root.
+const JUDGEMENT_CENTER_OFFSET_Y = 136;
+const JUDGEMENT_TIMING_CENTER_OFFSET_Y = 65;
 
 interface RankSpriteRect {
   readonly offsetX: number;
@@ -93,6 +89,8 @@ interface HudStaticSignature {
   scoreDelta: number | undefined;
   combo: number | undefined;
   perfectCombo: boolean | undefined;
+  fullCombo: boolean | undefined;
+  continuationEffects: boolean | undefined;
   life: number | undefined;
   maxLife: number | undefined;
   rank: string | undefined;
@@ -414,6 +412,8 @@ export class HudLayer {
     scoreDelta: undefined,
     combo: undefined,
     perfectCombo: undefined,
+    fullCombo: undefined,
+    continuationEffects: undefined,
     life: undefined,
     maxLife: undefined,
     rank: undefined,
@@ -426,6 +426,20 @@ export class HudLayer {
   private judgementWasAnimating = false;
   private comboWasAnimating = false;
   private titleIntroductionWasAnimating = false;
+  private overlayTextWasVisible = false;
+  private readonly overlayFonts = new Map<string, TmpSdfFont>();
+  private introOnly = false;
+
+  drawIntroduction(state: RenderHudState, overlayTexts?: readonly RenderOverlayText[]): void {
+    this.introOnly = true;
+    this.forceRedraw = true;
+    try {
+      this.draw(state, overlayTexts);
+    } finally {
+      this.introOnly = false;
+      this.forceRedraw = true;
+    }
+  }
   private disposed = false;
 
   constructor(canvas: HTMLCanvasElement, assets: OurNotesAssetManifest) {
@@ -473,6 +487,12 @@ export class HudLayer {
       ...this.assets.hud.comboDigitUrls.map((url, digit) => [`combo:${digit}`, url] as const),
       ["combo:perfect:label", this.assets.hud.perfectComboLabelUrl],
       ...this.assets.hud.perfectComboDigitUrls.map((url, digit) => [`combo:perfect:${digit}`, url] as const),
+      ...Object.entries(this.assets.hud.comboTiers ?? {}).flatMap(([tier, assets]) => [
+        [`combo:tier:${tier}:label`, assets.labelUrl] as const,
+        ...assets.baseDigitUrls.map((url, digit) => [`combo:tier:${tier}:base:${digit}`, url] as const),
+        ...assets.fillDigitUrls.map((url, digit) => [`combo:tier:${tier}:fill:${digit}`, url] as const),
+        ...(assets.glowUrl ? [[`combo:tier:${tier}:glow`, assets.glowUrl] as const] : []),
+      ]),
       ["pause:icon", this.assets.hud.pauseIconUrl],
       ["pause:frame", this.assets.hud.pauseFrameUrl],
       ["pause:shadow", this.assets.hud.pauseShadowUrl],
@@ -525,10 +545,25 @@ export class HudLayer {
     if (fontResult?.status === "rejected") throw fontResult.reason;
   }
 
-  draw(state: RenderHudState | undefined): void {
+  async loadOverlayFonts(manifest: Readonly<Record<string, TmpSdfFontAssetManifest>>): Promise<void> {
+    await Promise.all(
+      Object.entries(manifest).map(async ([key, value]) => {
+        const font = await TmpSdfFont.load(value);
+        if (this.disposed) {
+          font.dispose();
+          return;
+        }
+        this.overlayFonts.get(key)?.dispose();
+        this.overlayFonts.set(key, font);
+      }),
+    );
+  }
+
+  draw(state: RenderHudState | undefined, overlayTexts?: readonly RenderOverlayText[]): void {
     const context = this.context;
     const next = state ?? EMPTY_HUD_STATE;
-    const visible = next.visible !== false;
+    const hudVisible = next.visible !== false;
+    const visible = hudVisible || Boolean(overlayTexts?.length);
     if (!visible) {
       if (this.renderedVisible || this.forceRedraw) {
         context.setTransform(1, 0, 0, 1, 0, 0);
@@ -538,6 +573,7 @@ export class HudLayer {
       this.judgementWasAnimating = false;
       this.comboWasAnimating = false;
       this.titleIntroductionWasAnimating = false;
+      this.overlayTextWasVisible = false;
       this.forceRedraw = false;
       return;
     }
@@ -546,7 +582,7 @@ export class HudLayer {
       next.judgements?.some((judgement) => judgement.age < JUDGEMENT_SHOW_DURATION) ||
       (next.judgement && (next.judgementAge ?? 0) < JUDGEMENT_SHOW_DURATION),
     );
-    const comboAnimating = Boolean(next.combo && next.combo >= 2 && (next.comboAge ?? Infinity) < COMBO_ADD_DURATION);
+    const comboAnimating = Boolean(next.combo && next.combo >= 1 && (next.comboAge ?? Infinity) < COMBO_ADD_DURATION);
     const titleIntroductionAnimating = Boolean(next.titleIntroduction && next.titleIntroduction.alpha > 0);
     if (
       !this.forceRedraw &&
@@ -557,7 +593,9 @@ export class HudLayer {
       !comboAnimating &&
       !this.comboWasAnimating &&
       !titleIntroductionAnimating &&
-      !this.titleIntroductionWasAnimating
+      !this.titleIntroductionWasAnimating &&
+      !overlayTexts?.length &&
+      !this.overlayTextWasVisible
     ) {
       return;
     }
@@ -572,11 +610,33 @@ export class HudLayer {
     context.scale(scale, scale);
     context.imageSmoothingEnabled = true;
     context.lineJoin = "round";
-    this.drawScore(next);
-    this.drawLife(next);
-    this.drawCombo(next);
-    this.drawJudgement(next);
-    this.drawTitleIntroduction(next);
+    if (hudVisible && !this.introOnly) {
+      this.drawScore(next);
+      this.drawLife(next);
+      this.drawCombo(next);
+      this.drawJudgement(next);
+    }
+    if (hudVisible) this.drawTitleIntroduction(next);
+    if (overlayTexts?.length) {
+      context.save();
+      try {
+        context.setTransform(this.pixelRatio, 0, 0, this.pixelRatio, 0, 0);
+        for (const item of overlayTexts) {
+          const font = this.overlayFonts.get(item.fontKey);
+          if (!font) throw new Error(`Overlay font was not loaded: ${item.fontKey}`);
+          const [r, g, b, a] = item.color;
+          context.globalAlpha = clamp(a, 0, 1);
+          font.drawTextInRect(context, item.text, item.bounds, {
+            fontSize: item.fontSize,
+            align: item.align,
+            verticalAlign: item.verticalAlign,
+            color: `rgb(${Math.round(r * 255)}, ${Math.round(g * 255)}, ${Math.round(b * 255)})`,
+          });
+        }
+      } finally {
+        context.restore();
+      }
+    }
     // Live skill cells use a separate prefab/atlas. They intentionally remain
     // absent until those source assets can be rendered; generic panels would
     // be visibly unrelated to the original UI.
@@ -585,6 +645,7 @@ export class HudLayer {
     this.judgementWasAnimating = judgementAnimating;
     this.comboWasAnimating = comboAnimating;
     this.titleIntroductionWasAnimating = titleIntroductionAnimating;
+    this.overlayTextWasVisible = Boolean(overlayTexts?.length);
     this.forceRedraw = false;
   }
 
@@ -595,6 +656,8 @@ export class HudLayer {
       previous.scoreDelta !== state.scoreDelta ||
       previous.combo !== state.combo ||
       previous.perfectCombo !== state.perfectCombo ||
+      previous.fullCombo !== state.fullCombo ||
+      previous.continuationEffects !== state.continuationEffects ||
       previous.life !== state.life ||
       previous.maxLife !== state.maxLife ||
       previous.rank !== state.rank ||
@@ -610,6 +673,8 @@ export class HudLayer {
     target.scoreDelta = state.scoreDelta;
     target.combo = state.combo;
     target.perfectCombo = state.perfectCombo;
+    target.fullCombo = state.fullCombo;
+    target.continuationEffects = state.continuationEffects;
     target.life = state.life;
     target.maxLife = state.maxLife;
     target.rank = state.rank;
@@ -672,7 +737,13 @@ export class HudLayer {
     this.drawHeaderBackground();
 
     const rankBase = this.hudImages.get("rank:base");
-    if (rankBase) drawNineSlice(context, rankBase, 6, 0, 149, 160, { left: 26, top: 4, right: 26, bottom: 25 });
+    if (rankBase)
+      drawNineSlice(context, rankBase, 6, 0, 149, 160, {
+        left: 26,
+        top: 4,
+        right: 26,
+        bottom: 25,
+      });
     this.tmpSdfFont?.drawText(context, "RANK", 80.5, 31, {
       align: "center",
       characterSpacing: HUD_CHARACTER_SPACING,
@@ -916,9 +987,13 @@ export class HudLayer {
   }
 
   private drawCombo(state: RenderHudState): void {
-    if (!state.combo || state.combo < 2) return;
+    if (!state.combo || state.combo < 1) return;
+    if (this.assets.hud.comboTiers) {
+      this.drawNativeCombo(state);
+      return;
+    }
     const comboText = String(Math.min(9999, Math.max(0, Math.round(state.combo))));
-    const prefix = state.perfectCombo ? "combo:perfect" : "combo";
+    const prefix = state.continuationEffects !== false && state.perfectCombo ? "combo:perfect" : "combo";
     const label = this.hudImages.get(`${prefix}:label`);
     const digits = [...comboText].map((digit) => this.hudImages.get(`${prefix}:${digit}`));
     if (!label || digits.some((digit) => !digit)) return;
@@ -959,6 +1034,98 @@ export class HudLayer {
       context.drawImage(digit, x - width / 2, -height / 2, width, height);
     }
     context.restore();
+  }
+
+  private drawNativeCombo(state: RenderHudState): void {
+    const tier =
+      state.continuationEffects === false
+        ? "normal"
+        : state.perfectCombo
+          ? "allPerfect"
+          : state.fullCombo
+            ? "fullCombo"
+            : "normal";
+    const prefix = `combo:tier:${tier}`;
+    const geometry = this.assets.hud.comboTiers?.[tier].geometry;
+    const label = this.hudImages.get(`${prefix}:label`);
+    const text = String(Math.min(9999, Math.max(1, Math.trunc(state.combo ?? 1))));
+    const base = [...text].map((digit) => this.hudImages.get(`${prefix}:base:${digit}`));
+    const fill = [...text].map((digit) => this.hudImages.get(`${prefix}:fill:${digit}`));
+    if (!label || base.some((image) => !image) || fill.some((image) => !image)) return;
+    const context = this.context;
+    // Formal Live.unity UIComboCounterView: ContentArea top anchor, 120px
+    // digit frames, -34 spacing. New tiers use base+fill images, not old 112px digits.
+    const x = this.logicalWidth / 2 + 720;
+    const y = 510;
+    const age = Math.max(0, state.comboAge ?? COMBO_ADD_DURATION);
+    const rising = smoothstep01(age / COMBO_ADD_PEAK_TIME);
+    const falling = smoothstep01((age - COMBO_ADD_PEAK_TIME) / (COMBO_ADD_DURATION - COMBO_ADD_PEAK_TIME));
+    // LiveComboAdd's three streamed CountRoot scale curves: .9 -> 1.1 -> 1.
+    // Root and Title CanvasGroup alpha are constant 1 in the same clip.
+    const scale =
+      age < COMBO_ADD_PEAK_TIME
+        ? 0.8999999761581421 + 0.20000004768371582 * rising
+        : 1.100000023841858 - 0.10000002384185791 * falling;
+    const alpha = 1;
+    context.save();
+    context.globalAlpha = alpha;
+    const glow = this.hudImages.get(`${prefix}:glow`);
+    if (glow) {
+      const width = text.length * 120 + (text.length - 1) * -34 + 280;
+      context.globalAlpha = alpha * 0.8627451062202454;
+      this.drawComboSprite(glow, geometry?.glow, x - 4 - width / 2, y + 14 - 199, width, 398);
+      context.globalAlpha = alpha;
+    }
+    this.drawComboSprite(
+      label,
+      geometry?.label,
+      x - (168 * 1.149999976158142) / 2,
+      y - 98 + 1,
+      168 * 1.149999976158142,
+      38 * 1.149999976158142,
+    );
+    context.translate(x, y + 18);
+    context.scale(scale, scale);
+    const width = text.length * 120 + (text.length - 1) * -34;
+    for (let index = 0; index < text.length; index += 1) {
+      const center = -width / 2 + 60 + index * 86;
+      const baseImage = base[index];
+      const fillImage = fill[index];
+      for (const [image, sprite] of [
+        [baseImage, geometry?.baseDigits[Number(text[index])]],
+        [fillImage, geometry?.fillDigits[Number(text[index])]],
+      ] as const) {
+        if (!image) continue;
+        const width = sprite?.rectWidth ?? image.naturalWidth;
+        const height = sprite?.rectHeight ?? image.naturalHeight;
+        this.drawComboSprite(image, sprite, center - width / 2, -height / 2, width, height);
+      }
+    }
+    context.restore();
+  }
+
+  /** Simple UGUI Image padding keeps cropped base/fill sprites in their authored full rect. */
+  private drawComboSprite(
+    image: HTMLImageElement,
+    sprite: HudSpriteGeometry | undefined,
+    left: number,
+    top: number,
+    width: number,
+    height: number,
+  ): void {
+    if (!sprite) {
+      this.context.drawImage(image, left, top, width, height);
+      return;
+    }
+    const scaleX = width / sprite.rectWidth;
+    const scaleY = height / sprite.rectHeight;
+    this.context.drawImage(
+      image,
+      left + sprite.offsetX * scaleX,
+      top + (sprite.rectHeight - sprite.textureHeight - sprite.offsetY) * scaleY,
+      sprite.textureWidth * scaleX,
+      sprite.textureHeight * scaleY,
+    );
   }
 
   private drawJudgement(state: RenderHudState): void {
@@ -1018,12 +1185,12 @@ export class HudLayer {
     if (age >= JUDGEMENT_SHOW_DURATION) return;
     const image = this.judgementImages[judgement];
     const context = this.context;
-    // Live.prefab: UILiveJudgement y=-109; its effect_root/main_judge child
-    // places the judgement center another 16 px below that root. Initialize
-    // replaces the common editor placeholder with Image.SetNativeSize().
-    const y = this.logicalHeight / 2 + 66;
+    const y = this.logicalHeight / 2 + JUDGEMENT_CENTER_OFFSET_Y;
     if (image && age < JUDGEMENT_SHOW_DURATION) {
-      const [width, height] = JUDGEMENT_NATIVE_SIZES[judgement];
+      // Manifest judgement PNGs retain their full Sprite rect; SetNativeSize
+      // uses those source dimensions (including formal Perfect's 323x89).
+      const width = image.naturalWidth;
+      const height = image.naturalHeight;
       context.save();
       context.translate(x, y);
       const scale = sampleJudgementPunchScale(Math.max(0, age));
@@ -1035,7 +1202,7 @@ export class HudLayer {
     const timing = resolveJudgementTimingPresentation(state, judgement, fastSlow, differenceMs, Math.max(0, age));
     if (!timing) return;
     context.save();
-    context.translate(x, y);
+    context.translate(x, this.logicalHeight / 2 + JUDGEMENT_TIMING_CENTER_OFFSET_Y);
     context.globalAlpha *= timing.alpha;
     context.scale(timing.scale, timing.scale);
     if (timing.mode === "sprite" && timing.timing !== "none") {
@@ -1096,7 +1263,14 @@ export class HudLayer {
       if (sdfFont?.canRender(text)) {
         const measured = sdfFont.measureText(text, size);
         const fittedSize = measured && measured > maxWidth ? Math.max(12, size * (maxWidth / measured)) : size;
-        if (sdfFont.drawText(context, text, x, y, { align: "center", fontSize: fittedSize, color })) return;
+        if (
+          sdfFont.drawText(context, text, x, y, {
+            align: "center",
+            fontSize: fittedSize,
+            color,
+          })
+        )
+          return;
       } else if (waitForSdf && !sdfFont) {
         return;
       }
@@ -1129,13 +1303,13 @@ export class HudLayer {
           layout.normalJacketSize,
         );
       this.drawNormalTitleMetadata(introduction, layout, fontFamily, numericFont, waitForNumericFont, theme);
-      context.globalAlpha = rightAlpha;
-      this.drawGekisouIntroduction(introduction, layout, fontFamily, numericFont, waitForNumericFont, theme);
     } else {
       context.globalAlpha = simpleAlpha;
       if (jacket) context.drawImage(jacket, layout.jacketLeft, layout.jacketTop, layout.jacketSize, layout.jacketSize);
       this.drawSimpleTitleMetadata(introduction, layout, fontFamily, numericFont, waitForNumericFont);
     }
+    context.globalAlpha = rightAlpha;
+    this.drawGekisouIntroduction(introduction, layout, fontFamily, numericFont, waitForNumericFont, theme);
 
     context.globalAlpha = rootAlpha;
     const ribbonVariant = introduction.ribbonVariant ?? "panel";
@@ -1530,6 +1704,8 @@ export class HudLayer {
     this.titleSdfFont?.dispose();
     this.titleSdfFont = undefined;
     this.numericSdfFont?.dispose();
+    for (const font of this.overlayFonts.values()) font.dispose();
+    this.overlayFonts.clear();
     this.numericSdfFont = undefined;
     this.pendingIntroductionFontKeys.clear();
     this.failedIntroductionFontKeys.clear();

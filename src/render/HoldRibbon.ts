@@ -6,12 +6,14 @@ import {
   DataTexture,
   DynamicDrawUsage,
   Group,
+  InterleavedBuffer,
+  InterleavedBufferAttribute,
   LinearFilter,
   Mesh,
   NormalBlending,
   RGBAFormat,
   ShaderMaterial,
-  SRGBColorSpace,
+  NoColorSpace,
   TextureLoader,
   UnsignedByteType,
   Vector4,
@@ -50,19 +52,10 @@ interface HoldVisual {
   geometry: BufferGeometry;
   material: ShaderMaterial;
   capacity: number;
-  positions: Float32Array;
-  colors: Float32Array;
-  localBounds: Float32Array;
-  texCoords: Float32Array;
+  vertices: Float32Array;
   guideUvs: Float32Array;
-  positionAttribute?: BufferAttribute;
-  colorAttribute?: BufferAttribute;
-  localBoundsAttribute?: BufferAttribute;
-  texCoordAttribute?: BufferAttribute;
-  positionUpdateRange: { start: number; count: number };
-  colorUpdateRange: { start: number; count: number };
-  localBoundsUpdateRange: { start: number; count: number };
-  texCoordUpdateRange: { start: number; count: number };
+  vertexBuffer?: InterleavedBuffer;
+  vertexUpdateRange: { start: number; count: number };
   lastSeen: number;
   lastState: number;
   lastGuide: number;
@@ -74,6 +67,8 @@ interface GradientTextureResult {
 }
 
 const EMPTY_FLOATS = new Float32Array(0);
+// position3, color4, localBounds2, texCoord4 share one active vertex prefix.
+const RIBBON_VERTEX_STRIDE = 13;
 const clamp01 = (value: number): number => Math.max(0, Math.min(1, value));
 const f32 = Math.fround;
 // LiveNoteLineViewBase._offsetValue from class init. One mesh unit is three
@@ -403,7 +398,8 @@ export class HoldRibbonLayer {
   async loadTexture(loader = new TextureLoader()): Promise<void> {
     if (!this.assets.particles.slideLineTextureUrl) return;
     const texture = await loader.loadAsync(this.assets.particles.slideLineTextureUrl);
-    texture.colorSpace = SRGBColorSpace;
+    // Native HSV/glow calculations consume Gamma texels, not decoded linear RGB.
+    texture.colorSpace = NoColorSpace;
     texture.wrapS = ClampToEdgeWrapping;
     texture.wrapT = ClampToEdgeWrapping;
     texture.minFilter = LinearFilter;
@@ -499,15 +495,9 @@ export class HoldRibbonLayer {
       geometry,
       material,
       capacity: 0,
-      positions: EMPTY_FLOATS,
-      colors: EMPTY_FLOATS,
-      localBounds: EMPTY_FLOATS,
-      texCoords: EMPTY_FLOATS,
+      vertices: EMPTY_FLOATS,
       guideUvs: EMPTY_FLOATS,
-      positionUpdateRange: { start: 0, count: 0 },
-      colorUpdateRange: { start: 0, count: 0 },
-      localBoundsUpdateRange: { start: 0, count: 0 },
-      texCoordUpdateRange: { start: 0, count: 0 },
+      vertexUpdateRange: { start: 0, count: 0 },
       lastSeen: 0,
       lastState: Number.NaN,
       lastGuide: Number.NaN,
@@ -523,10 +513,7 @@ export class HoldRibbonLayer {
     visual.capacity = capacity;
     this.capacityGrowths += 1;
     const vertexCount = capacity * RIBBON_COLUMNS;
-    visual.positions = new Float32Array(vertexCount * 3);
-    visual.colors = new Float32Array(vertexCount * 4);
-    visual.localBounds = new Float32Array(vertexCount * 2);
-    visual.texCoords = new Float32Array(vertexCount * 4);
+    visual.vertices = new Float32Array(vertexCount * RIBBON_VERTEX_STRIDE);
     visual.guideUvs = new Float32Array(vertexCount * 2);
     for (let sample = 0; sample < capacity; sample += 1) {
       for (let column = 0; column < RIBBON_COLUMNS; column += 1) {
@@ -549,19 +536,13 @@ export class HoldRibbonLayer {
         indices[offset + 5] = near + strip + 1;
       }
     }
-    const position = new BufferAttribute(visual.positions, 3).setUsage(DynamicDrawUsage);
-    const color = new BufferAttribute(visual.colors, 4).setUsage(DynamicDrawUsage);
-    const localBounds = new BufferAttribute(visual.localBounds, 2).setUsage(DynamicDrawUsage);
-    const texCoord = new BufferAttribute(visual.texCoords, 4).setUsage(DynamicDrawUsage);
+    const vertices = new InterleavedBuffer(visual.vertices, RIBBON_VERTEX_STRIDE).setUsage(DynamicDrawUsage);
+    visual.vertexBuffer = vertices;
+    geometry.setAttribute("position", new InterleavedBufferAttribute(vertices, 3, 0));
+    geometry.setAttribute("color", new InterleavedBufferAttribute(vertices, 4, 3));
+    geometry.setAttribute("aLocalBounds", new InterleavedBufferAttribute(vertices, 2, 7));
+    geometry.setAttribute("aTexCoord", new InterleavedBufferAttribute(vertices, 4, 9));
     const guideUv = new BufferAttribute(visual.guideUvs, 2);
-    visual.positionAttribute = position;
-    visual.colorAttribute = color;
-    visual.localBoundsAttribute = localBounds;
-    visual.texCoordAttribute = texCoord;
-    geometry.setAttribute("position", position);
-    geometry.setAttribute("color", color);
-    geometry.setAttribute("aLocalBounds", localBounds);
-    geometry.setAttribute("aTexCoord", texCoord);
     geometry.setAttribute("uv", guideUv);
     geometry.setIndex(new BufferAttribute(indices, 1));
     visual.geometry = geometry;
@@ -618,26 +599,11 @@ export class HoldRibbonLayer {
 
     visual.geometry.setDrawRange(0, Math.max(0, sampleIndex - 1) * 18);
     const vertexCount = sampleIndex * RIBBON_COLUMNS;
-    const position = visual.positionAttribute!;
-    const color = visual.colorAttribute!;
-    const localBounds = visual.localBoundsAttribute!;
-    const texCoord = visual.texCoordAttribute!;
-    visual.positionUpdateRange.count = vertexCount * 3;
-    position.updateRanges.length = 1;
-    position.updateRanges[0] = visual.positionUpdateRange;
-    visual.colorUpdateRange.count = vertexCount * 4;
-    color.updateRanges.length = 1;
-    color.updateRanges[0] = visual.colorUpdateRange;
-    visual.localBoundsUpdateRange.count = vertexCount * 2;
-    localBounds.updateRanges.length = 1;
-    localBounds.updateRanges[0] = visual.localBoundsUpdateRange;
-    visual.texCoordUpdateRange.count = vertexCount * 4;
-    texCoord.updateRanges.length = 1;
-    texCoord.updateRanges[0] = visual.texCoordUpdateRange;
-    position.needsUpdate = true;
-    color.needsUpdate = true;
-    localBounds.needsUpdate = true;
-    texCoord.needsUpdate = true;
+    const vertices = visual.vertexBuffer!;
+    visual.vertexUpdateRange.count = vertexCount * RIBBON_VERTEX_STRIDE;
+    vertices.updateRanges.length = 1;
+    vertices.updateRanges[0] = visual.vertexUpdateRange;
+    vertices.needsUpdate = true;
   }
 
   private minimumAuthoredWidth(points: ReadonlyArray<NativeRenderPathPoint>, override: number | undefined): number {
@@ -706,28 +672,28 @@ export class HoldRibbonLayer {
     const alpha = opacity * fade;
     for (let column = 0; column < RIBBON_COLUMNS; column += 1) {
       const vertex = sampleIndex * RIBBON_COLUMNS + column;
-      const positionOffset = vertex * 3;
-      const colorOffset = vertex * 4;
-      const boundsOffset = vertex * 2;
-      const texCoordOffset = vertex * 4;
+      const positionOffset = vertex * RIBBON_VERTEX_STRIDE;
+      const colorOffset = positionOffset + 3;
+      const boundsOffset = positionOffset + 7;
+      const texCoordOffset = positionOffset + 9;
       const leftBorder = column < 2;
       const referenceLeft = leftBorder ? columns[0]! : columns[2]!;
       const referenceRight = leftBorder ? columns[1]! : columns[3]!;
       const textureLeft = leftBorder ? 0.5 * (1 - leftUvAmount) : rightInnerU;
       const textureRight = leftBorder ? leftInnerU : 0.5 + 0.5 * rightUvAmount;
-      visual.positions[positionOffset] = columns[column]!;
-      visual.positions[positionOffset + 1] = y;
-      visual.positions[positionOffset + 2] = z;
-      visual.colors[colorOffset] = lineProgress;
-      visual.colors[colorOffset + 1] = column === 0 || column === 3 ? 1 : 0;
-      visual.colors[colorOffset + 2] = 0;
-      visual.colors[colorOffset + 3] = alpha;
-      visual.localBounds[boundsOffset] = referenceLeft;
-      visual.localBounds[boundsOffset + 1] = referenceRight;
-      visual.texCoords[texCoordOffset] = textureLeft;
-      visual.texCoords[texCoordOffset + 1] = textureRight;
-      visual.texCoords[texCoordOffset + 2] = MAIN_TEX_ROW_BLEND;
-      visual.texCoords[texCoordOffset + 3] = MAIN_TEX_ROW_V;
+      visual.vertices[positionOffset] = columns[column]!;
+      visual.vertices[positionOffset + 1] = y;
+      visual.vertices[positionOffset + 2] = z;
+      visual.vertices[colorOffset] = lineProgress;
+      visual.vertices[colorOffset + 1] = column === 0 || column === 3 ? 1 : 0;
+      visual.vertices[colorOffset + 2] = 0;
+      visual.vertices[colorOffset + 3] = alpha;
+      visual.vertices[boundsOffset] = referenceLeft;
+      visual.vertices[boundsOffset + 1] = referenceRight;
+      visual.vertices[texCoordOffset] = textureLeft;
+      visual.vertices[texCoordOffset + 1] = textureRight;
+      visual.vertices[texCoordOffset + 2] = MAIN_TEX_ROW_BLEND;
+      visual.vertices[texCoordOffset + 3] = MAIN_TEX_ROW_V;
     }
   }
 

@@ -8,7 +8,8 @@ import {
   DoubleSide,
   DynamicDrawUsage,
   Group,
-  InstancedBufferAttribute,
+  InstancedInterleavedBuffer,
+  InterleavedBufferAttribute,
   InstancedBufferGeometry,
   LinearFilter,
   Mesh,
@@ -42,19 +43,37 @@ import {
   type RenderLaneEffectKind,
   type RenderParticleEffect,
 } from "@haneoka/cassiopeia-plugin-our-notes";
+import {
+  evaluateNativeMinMaxCurve,
+  evaluateNativeMinMaxGradient,
+  nativeParticleRandom as random,
+  prepareNativeCurveLuts,
+  NativeParticleMotionClock,
+  OUR_NOTES_MAXIMUM_PARTICLE_TIMESTEP,
+  readNativeParticleMotionSource,
+  type NativeParticleMotionState,
+  type NativeParticleMotionSource,
+  quantizeParticleColor,
+  serializedColor,
+  type NativeColor,
+} from "@haneoka/cassiopeia-plugin-our-notes/authored";
+export {
+  evaluateNativeAnimationCurve,
+  evaluateNativeMinMaxCurve,
+  evaluateNativeMinMaxCurveExact,
+  evaluateNativeMinMaxGradient,
+  getNativeCurveLutStats,
+  nativeParticleRandom,
+  prepareNativeCurveLuts,
+  resetNativeCurveLutCache,
+  type NativeCurveLutStats,
+} from "@haneoka/cassiopeia-plugin-our-notes/authored";
 import { StageProjector } from "./stageGeometry";
 
 type NativeRecord = Record<string, unknown>;
 type BillboardTextureKey = Exclude<Effect001TextureKey, "wall">;
 type LoadedTextureKey = Effect001TextureKey | "line" | "pillar" | "laneEffect";
 type EffectMeshShaderMode = "mobileAddHdr" | "uiAdditive";
-
-interface NativeColor {
-  r: number;
-  g: number;
-  b: number;
-  a: number;
-}
 
 export interface NativeParticleSystemData {
   raw: NativeRecord;
@@ -73,7 +92,9 @@ interface LoadedParticleSystem extends NativeParticleSystemData {
   /** Cached once when the authored system is loaded; read on every effect frame. */
   animationPathHash?: number;
   readonly animationPathHierarchy: ReadonlyArray<number>;
+  readonly baseActiveByPath: ReadonlyMap<number, boolean>;
   readonly nameHash: number;
+  readonly motionSource: NativeParticleMotionSource;
   emissionBuffer: ParticleEmission[];
   emissionPool: ParticleEmission[];
 }
@@ -88,6 +109,7 @@ interface NativeClipBinding {
   attribute: number;
   curveStart: number;
   componentCount: number;
+  typeId?: number;
 }
 
 export interface NativeAnimationClip {
@@ -95,6 +117,8 @@ export interface NativeAnimationClip {
   streamedCurveCount: number;
   constantValues: ReadonlyArray<number>;
   frames: ReadonlyArray<NativeClipFrame>;
+  /** Loader-owned sparse frame lists; external clips retain the linear fallback. */
+  curveFrames?: ReadonlyMap<number, ReadonlyArray<NativeClipFrame>>;
   bindings: ReadonlyArray<NativeClipBinding>;
   bindingLookup: ReadonlyMap<number, ReadonlyMap<number, NativeClipBinding>>;
 }
@@ -114,6 +138,30 @@ interface ParticleEmission {
   originY: number;
   originZ: number;
   index: number;
+  shapeBirthWidth?: number;
+  motion?: CachedParticleMotion;
+}
+
+interface CachedParticleMotion extends NativeParticleMotionState {
+  lastSeen: number;
+}
+
+interface ParticleMotionSystem {
+  initialized: boolean;
+  seed: number;
+  lastAge: number;
+  animationTimeOffset: number;
+  epoch: number;
+  readonly clock: NativeParticleMotionClock;
+  readonly particles: Map<number, CachedParticleMotion>;
+  readonly pool: CachedParticleMotion[];
+}
+
+interface ParticleShapeBirthWidths {
+  seed: number;
+  lastAge: number;
+  epoch: number;
+  readonly widths: Map<number, { width: number; lastSeen: number }>;
 }
 
 interface EmissionRing {
@@ -162,6 +210,13 @@ export interface NativeBillboardTrace {
   /** Per-particle seed: draws are `nativeParticleRandom(particleSeed + k)`. */
   particleSeed: number;
   simulationSpeed: number;
+  /** Offline trace clock; playback seconds are mapped by the live evaluator. */
+  clock?: {
+    readonly realTimeOffset: number;
+    readonly currentSimulationTime: number;
+    readonly emissionSimulationTime: number;
+    readonly simulationTimeAt: (playbackSeconds: number) => number;
+  };
   materialTint?: readonly [number, number, number, number];
   age: number;
   lifetime: number;
@@ -231,12 +286,20 @@ interface ImpactVisual {
   lastSeen: number;
   prefabId: number;
   readonly emissionStates: Map<LoadedParticleSystem, IncrementalEmissionState>;
+  readonly shapeBirthWidths: Map<LoadedParticleSystem, ParticleShapeBirthWidths>;
+  readonly motionStates: Map<LoadedParticleSystem, ParticleMotionSystem>;
 }
 
 const EMPTY_EFFECTS: ReadonlyArray<RenderParticleEffect> = [];
 const EMPTY_VALUES: ReadonlyArray<unknown> = [];
 const EMPTY_PATH_HASHES: ReadonlyArray<number> = [];
-const LANE_EFFECT_EMISSION: ParticleEmission = { simulationTime: 0, originX: 0, originY: 0, originZ: 0, index: 0 };
+const LANE_EFFECT_EMISSION: ParticleEmission = {
+  simulationTime: 0,
+  originX: 0,
+  originY: 0,
+  originZ: 0,
+  index: 0,
+};
 // The native lane-effect prefab root is +90° around Unity X. StageProjector
 // reflects Unity Z into Three space, so the equivalent rendered rotation is
 // -90°. Keeping the Unity sign here flips the long normal-lane fill behind
@@ -256,9 +319,17 @@ function laneEffectAssetKey(kind: RenderLaneEffectKind): LaneEffectAssetKey {
       return "flickLeft";
     case "lane-effect-flick-right":
       return "flickRight";
+    case "lane-effect-gekisou":
+      return "gekisou";
   }
 }
-const SPRITE_NAMES: ReadonlyArray<Effect001SpriteName> = ["frame", "pillar01", "pillar02", "pillar03", "pillar04"];
+const SPRITE_NAMES: ReadonlyArray<Effect001SpriteName> = [
+  "frame",
+  "pillar01",
+  "pillar02",
+  "pillar03",
+  "pillar04",
+];
 const PATH_HASH: Readonly<Record<Effect001SpriteName, number>> = {
   frame: unityStringHash("frame"),
   pillar01: unityStringHash("pillar01"),
@@ -332,12 +403,12 @@ const WALL_MESH_HEIGHT = Math.fround(2.4085028171539307);
 const WALL_RENDERER_PIVOT_Y = Math.fround(-0.21);
 export const WALL_MESH_SHADER_PIVOT_Y = Math.fround(-WALL_RENDERER_PIVOT_Y * WALL_MESH_HEIGHT);
 const FRAME_SLICE_BORDER = [0.408, 0.4] as const;
-const ZERO_COLOR: NativeColor = { r: 0, g: 0, b: 0, a: 0 };
 const PARTICLE_COLOR_SCRATCH: NativeColor = { r: 0, g: 0, b: 0, a: 0 };
 const INITIAL_MIN_COLOR_SCRATCH: NativeColor = { r: 0, g: 0, b: 0, a: 0 };
 const INITIAL_MAX_COLOR_SCRATCH: NativeColor = { r: 0, g: 0, b: 0, a: 0 };
 const PARTICLE_LIFETIME_COLOR_SCRATCH: NativeColor = { r: 0, g: 0, b: 0, a: 0 };
 const SHAPE_POSITION_SCRATCH: [number, number, number] = [0, 0, 0];
+const SHAPE_INITIAL_VELOCITY_SCRATCH: [number, number, number] = [0, 0, 0];
 const VELOCITY_POSITION_SCRATCH: [number, number, number] = [0, 0, 0];
 const MOVEMENT_PREVIOUS_SCRATCH: [number, number, number] = [0, 0, 0];
 const MOVEMENT_CURRENT_SCRATCH: [number, number, number] = [0, 0, 0];
@@ -356,7 +427,9 @@ const PARTICLE_SAMPLE_SCRATCH: ParticleSample = {
 };
 
 function record(value: unknown): NativeRecord | undefined {
-  return value !== null && typeof value === "object" && !Array.isArray(value) ? (value as NativeRecord) : undefined;
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? (value as NativeRecord)
+    : undefined;
 }
 
 function array(value: unknown): ReadonlyArray<unknown> {
@@ -384,378 +457,106 @@ function hash(value: string): number {
   return result >>> 0;
 }
 
-const UNITY_PARTICLE_RANDOM_MULTIPLIER = 0x6c078965;
-const UNITY_PARTICLE_RANDOM_VALUE_SCALE = Math.fround(1 / 0x7fffff);
-
-/** Unity's seeded particle random stream; `sampleParticle` draws with `seed + k`. */
-export function nativeParticleRandom(seed: number): number {
-  return random(seed);
-}
-
-function random(seed: number): number {
-  // Unity's ParticleSystem jobs seed four xorshift words from this LCG, then
-  // turn the low 23 bits of the first xorshift result into a float. The
-  // renderer stays stateless so a particle can be reconstructed every frame,
-  // but each derived stream uses the native generator rather than a guessed
-  // one-word xorshift.
-  const s0 = Math.trunc(seed) >>> 0;
-  const s1 = (Math.imul(s0, UNITY_PARTICLE_RANDOM_MULTIPLIER) + 1) >>> 0;
-  const s2 = (Math.imul(s1, UNITY_PARTICLE_RANDOM_MULTIPLIER) + 1) >>> 0;
-  const s3 = (Math.imul(s2, UNITY_PARTICLE_RANDOM_MULTIPLIER) + 1) >>> 0;
-  const temporary = (s0 ^ (s0 << 11)) >>> 0;
-  const next = (temporary ^ s3 ^ (temporary >>> 8) ^ (s3 >>> 19)) >>> 0;
-  return Math.fround(Math.fround(next & 0x7fffff) * UNITY_PARTICLE_RANDOM_VALUE_SCALE);
-}
-
-function cubic(a: number, b: number, c: number, d: number, value: number): number {
-  const inverse = 1 - value;
+const zeroOrbitRadialModules = new WeakSet<NativeRecord>();
+function knownPositiveZeroCurve(value: unknown): boolean {
+  const curve = record(value);
+  if (!curve || (curve.minMaxState !== 0 && curve.minMaxState !== 3)) return false;
   return (
-    inverse * inverse * inverse * a +
-    3 * inverse * inverse * value * b +
-    3 * inverse * value * value * c +
-    value * value * value * d
+    typeof curve.scalar === "number" &&
+    Number.isFinite(curve.scalar) &&
+    curve.scalar === 0 &&
+    !Object.is(curve.scalar, -0) &&
+    typeof curve.minScalar === "number" &&
+    Number.isFinite(curve.minScalar) &&
+    curve.minScalar === 0 &&
+    !Object.is(curve.minScalar, -0)
   );
 }
 
-const NATIVE_CURVE_LUT_SAMPLES = 512;
-const NATIVE_CURVE_LUT_RELATIVE_ERROR = 0.001;
-const NATIVE_CURVE_LUT_MIN_ERROR = 0.000001;
-const NATIVE_CURVE_LUT_VALIDATION_PROGRESS = [0.25, 0.5, 0.75] as const;
-
-interface NativeCurveLookup {
-  readonly exact: boolean;
-  readonly start: number;
-  readonly end: number;
-  readonly samples?: Float32Array;
-  readonly maxAbsError: number;
-  readonly tolerance: number;
-}
-
-export interface NativeCurveLutStats {
-  builtCurves: number;
-  lutCurves: number;
-  exactFallbackCurves: number;
-  maximumValidatedError: number;
-  maximumTolerance: number;
-  samplesPerCurve: number;
-}
-
-let nativeCurveLookupCache = new WeakMap<object, NativeCurveLookup>();
-const nativeCurveLutStats: NativeCurveLutStats = {
-  builtCurves: 0,
-  lutCurves: 0,
-  exactFallbackCurves: 0,
-  maximumValidatedError: 0,
-  maximumTolerance: 0,
-  samplesPerCurve: NATIVE_CURVE_LUT_SAMPLES,
-};
-
-function resetNativeCurveLutStats(): void {
-  nativeCurveLutStats.builtCurves = 0;
-  nativeCurveLutStats.lutCurves = 0;
-  nativeCurveLutStats.exactFallbackCurves = 0;
-  nativeCurveLutStats.maximumValidatedError = 0;
-  nativeCurveLutStats.maximumTolerance = 0;
-}
-
-/** Diagnostics are snapshots so callers cannot mutate the global cache counters. */
-export function getNativeCurveLutStats(): NativeCurveLutStats {
-  return { ...nativeCurveLutStats };
-}
-
-/** Test/benchmark hook; production never clears the atlas-lifetime curve cache. */
-export function resetNativeCurveLutCache(): void {
-  nativeCurveLookupCache = new WeakMap<object, NativeCurveLookup>();
-  resetNativeCurveLutStats();
-}
-
-/** Evaluates Unity's serialized AnimationCurve, including weighted tangents. */
-export function evaluateNativeAnimationCurve(value: unknown, time: number): number {
-  const curve = record(value);
-  const keys = array(curve?.m_Curve);
-  const first = record(keys[0]);
-  const last = record(keys[keys.length - 1]);
-  if (!first || !last) return 0;
-  if (time <= finite(first.time)) return finite(first.value);
-  if (time >= finite(last.time)) return finite(last.value);
-  let left = first;
-  let right = last;
-  for (let index = 1; index < keys.length; index += 1) {
-    const candidate = record(keys[index]);
-    if (!candidate) continue;
-    if (time <= finite(candidate.time)) {
-      right = candidate;
-      break;
-    }
-    left = candidate;
-  }
-  const t0 = finite(left.time);
-  const t1 = finite(right.time);
-  const duration = Math.max(Number.EPSILON, t1 - t0);
-  const v0 = finite(left.value);
-  const v1 = finite(right.value);
-  const outSlope = finite(left.outSlope);
-  const inSlope = finite(right.inSlope);
-  if (!Number.isFinite(outSlope) || !Number.isFinite(inSlope)) return time < t1 ? v0 : v1;
-  const outWeighted = (Math.round(finite(left.weightedMode)) & 2) !== 0;
-  const inWeighted = (Math.round(finite(right.weightedMode)) & 1) !== 0;
-  const outWeight = outWeighted ? clamp(finite(left.outWeight, 1 / 3)) : 1 / 3;
-  const inWeight = inWeighted ? clamp(finite(right.inWeight, 1 / 3)) : 1 / 3;
-  const x1 = t0 + duration * outWeight;
-  const x2 = t1 - duration * inWeight;
-  const y1 = v0 + outSlope * duration * outWeight;
-  const y2 = v1 - inSlope * duration * inWeight;
-  let low = 0;
-  let high = 1;
-  for (let iteration = 0; iteration < 18; iteration += 1) {
-    const middle = (low + high) / 2;
-    if (cubic(t0, x1, x2, t1, middle) < time) low = middle;
-    else high = middle;
-  }
-  return cubic(v0, y1, y2, v1, (low + high) / 2);
-}
-
-function hasNonFiniteCurveTangents(keys: ReadonlyArray<unknown>): boolean {
-  for (const rawKey of keys) {
-    const key = record(rawKey);
-    if (!key) continue;
-    for (const name of ["inSlope", "outSlope"] as const) {
-      const raw = key[name];
-      if (raw !== undefined && !Number.isFinite(Number(raw))) return true;
-    }
-  }
-  return false;
-}
-
-function buildNativeCurveLookup(curve: NativeRecord): NativeCurveLookup {
-  const keys = array(curve.m_Curve);
-  const first = record(keys[0]);
-  const last = record(keys[keys.length - 1]);
-  nativeCurveLutStats.builtCurves += 1;
-  if (!first || !last || hasNonFiniteCurveTangents(keys)) {
-    nativeCurveLutStats.exactFallbackCurves += 1;
-    return { exact: true, start: 0, end: 0, maxAbsError: 0, tolerance: 0 };
-  }
-  const start = finite(first.time);
-  const end = finite(last.time);
-  if (!(end > start)) {
-    nativeCurveLutStats.exactFallbackCurves += 1;
-    return { exact: true, start, end, maxAbsError: 0, tolerance: 0 };
-  }
-  const samples = new Float32Array(NATIVE_CURVE_LUT_SAMPLES);
-  let minimum = Number.POSITIVE_INFINITY;
-  let maximum = Number.NEGATIVE_INFINITY;
-  for (let index = 0; index < samples.length; index += 1) {
-    const time = start + ((end - start) * index) / (samples.length - 1);
-    const sample = evaluateNativeAnimationCurve(curve, time);
-    samples[index] = sample;
-    minimum = Math.min(minimum, sample);
-    maximum = Math.max(maximum, sample);
-  }
-  const tolerance = Math.max(NATIVE_CURVE_LUT_MIN_ERROR, (maximum - minimum) * NATIVE_CURVE_LUT_RELATIVE_ERROR);
-  let maxAbsError = 0;
-  // Validate every cell at quarter points. Curves with sharp/weighted segments that a
-  // 512-sample linear LUT cannot represent within the declared tolerance use
-  // the exact 18-step cubic solve instead.
-  for (let index = 0; index < samples.length - 1; index += 1) {
-    for (const progress of NATIVE_CURVE_LUT_VALIDATION_PROGRESS) {
-      const time = start + ((end - start) * (index + progress)) / (samples.length - 1);
-      const exact = evaluateNativeAnimationCurve(curve, time);
-      const approximate = lerp(samples[index]!, samples[index + 1]!, progress);
-      maxAbsError = Math.max(maxAbsError, Math.abs(exact - approximate));
-    }
-  }
-  nativeCurveLutStats.maximumValidatedError = Math.max(nativeCurveLutStats.maximumValidatedError, maxAbsError);
-  nativeCurveLutStats.maximumTolerance = Math.max(nativeCurveLutStats.maximumTolerance, tolerance);
-  if (maxAbsError > tolerance) {
-    nativeCurveLutStats.exactFallbackCurves += 1;
-    return { exact: true, start, end, maxAbsError, tolerance };
-  }
-  nativeCurveLutStats.lutCurves += 1;
-  return { exact: false, start, end, samples, maxAbsError, tolerance };
-}
-
-function nativeCurveLookup(value: unknown): NativeCurveLookup | undefined {
-  const curve = record(value);
-  if (!curve) return undefined;
-  const cached = nativeCurveLookupCache.get(curve);
-  if (cached) return cached;
-  const lookup = buildNativeCurveLookup(curve);
-  nativeCurveLookupCache.set(curve, lookup);
-  return lookup;
-}
-
-function evaluateNativeAnimationCurveCached(value: unknown, time: number): number {
-  const curve = record(value);
-  if (!curve) return 0;
-  const lookup = nativeCurveLookup(curve);
-  const samples = lookup?.samples;
-  if (!lookup || lookup.exact || !samples) return evaluateNativeAnimationCurve(curve, time);
-  if (time <= lookup.start) return samples[0]!;
-  if (time >= lookup.end) return samples[samples.length - 1]!;
-  const position = ((time - lookup.start) / (lookup.end - lookup.start)) * (samples.length - 1);
-  const left = Math.floor(position);
-  const progress = position - left;
-  return lerp(samples[left]!, samples[left + 1]!, progress);
-}
-
-/** Prewarm every serialized AnimationCurve in a decoded particle system. */
-export function prepareNativeCurveLuts(value: unknown): void {
-  const visited = new WeakSet<object>();
-  const visit = (candidate: unknown): void => {
-    if (candidate === null || typeof candidate !== "object") return;
-    if (visited.has(candidate)) return;
-    visited.add(candidate);
-    if (Array.isArray(candidate)) {
-      for (const item of candidate) visit(item);
-      return;
-    }
-    const object = candidate as NativeRecord;
-    if (Array.isArray(object.m_Curve)) nativeCurveLookup(object);
-    for (const child of Object.values(object)) visit(child);
-  };
-  visit(value);
-}
-
-function evaluateNativeMinMaxCurveWith(
+export function readNativeParticleSystem(
   value: unknown,
-  time: number,
-  randomValue: number,
-  evaluator: (curve: unknown, sampleTime: number) => number,
-): number {
-  const curve = record(value);
-  if (!curve) return 0;
-  const state = Math.round(finite(curve.minMaxState));
-  const maximum = finite(curve.scalar);
-  const minimum = finite(curve.minScalar);
-  if (state === 0) return maximum;
-  if (state === 1) return maximum * evaluator(curve.maxCurve, time);
-  if (state === 2) {
-    const minValue = minimum * evaluator(curve.minCurve, time);
-    const maxValue = maximum * evaluator(curve.maxCurve, time);
-    return lerp(minValue, maxValue, clamp(randomValue));
-  }
-  if (state === 3) return lerp(minimum, maximum, clamp(randomValue));
-  return 0;
-}
-
-/** Evaluates Unity MinMaxCurve without substituting display defaults for missing values. */
-export function evaluateNativeMinMaxCurve(value: unknown, time: number, randomValue = 0.5): number {
-  return evaluateNativeMinMaxCurveWith(value, time, randomValue, evaluateNativeAnimationCurveCached);
-}
-
-/** Exact reference path retained for tests and difficult-curve fallback. */
-export function evaluateNativeMinMaxCurveExact(value: unknown, time: number, randomValue = 0.5): number {
-  return evaluateNativeMinMaxCurveWith(value, time, randomValue, evaluateNativeAnimationCurve);
-}
-
-function serializedColor(value: unknown, target: NativeColor = { r: 0, g: 0, b: 0, a: 0 }): NativeColor {
-  const color = record(value);
-  target.r = finite(color?.r);
-  target.g = finite(color?.g);
-  target.b = finite(color?.b);
-  target.a = finite(color?.a);
-  return target;
-}
-
-function gradientChannel(
-  gradient: NativeRecord,
-  time: number,
-  component: "r" | "g" | "b" | "a",
-  alphaTiming: boolean,
-): number {
-  const count = Math.max(
-    0,
-    Math.min(8, Math.round(finite(gradient[alphaTiming ? "m_NumAlphaKeys" : "m_NumColorKeys"]))),
-  );
-  if (count === 0) return 1;
-  let leftIndex = 0;
-  let leftTime = finite(gradient[`${alphaTiming ? "atime" : "ctime"}0`]) / 65535;
-  let leftColor = record(gradient.key0);
-  if (time <= leftTime) return finite(leftColor?.[component], 1);
-  for (let index = 1; index < count; index += 1) {
-    const rightTime = finite(gradient[`${alphaTiming ? "atime" : "ctime"}${index}`]) / 65535;
-    const rightColor = record(gradient[`key${index}`]);
-    if (time <= rightTime) {
-      const progress =
-        finite(gradient.m_Mode) === 1 ? 0 : (time - leftTime) / Math.max(Number.EPSILON, rightTime - leftTime);
-      return lerp(finite(leftColor?.[component], 1), finite(rightColor?.[component], 1), progress);
-    }
-    leftIndex = index;
-    leftTime = rightTime;
-    leftColor = rightColor;
-  }
-  return finite(record(gradient[`key${leftIndex}`])?.[component], 1);
-}
-
-function evaluateGradient(value: unknown, time: number, target: NativeColor): NativeColor {
-  const gradient = record(value);
-  if (!gradient) {
-    target.r = 1;
-    target.g = 1;
-    target.b = 1;
-    target.a = 1;
-    return target;
-  }
-  const progress = clamp(time);
-  target.r = gradientChannel(gradient, progress, "r", false);
-  target.g = gradientChannel(gradient, progress, "g", false);
-  target.b = gradientChannel(gradient, progress, "b", false);
-  target.a = gradientChannel(gradient, progress, "a", true);
-  return target;
-}
-
-const GRADIENT_SCRATCH: NativeColor = { r: 0, g: 0, b: 0, a: 0 };
-
-/** Evaluates Unity MinMaxGradient using one stable per-particle random value. */
-export function evaluateNativeMinMaxGradient(
-  value: unknown,
-  time: number,
-  randomValue = 0.5,
-  target: NativeColor = { r: 0, g: 0, b: 0, a: 0 },
-): NativeColor {
-  const gradient = record(value);
-  if (!gradient) {
-    target.r = 1;
-    target.g = 1;
-    target.b = 1;
-    target.a = 1;
-    return target;
-  }
-  const state = Math.round(finite(gradient.minMaxState));
-  if (state === 0) return serializedColor(gradient.maxColor, target);
-  if (state === 1 || state === 4)
-    return evaluateGradient(gradient.maxGradient, state === 4 ? randomValue : time, target);
-  if (state === 2) {
-    serializedColor(gradient.minColor, target);
-    serializedColor(gradient.maxColor, GRADIENT_SCRATCH);
-    target.r = lerp(target.r, GRADIENT_SCRATCH.r, randomValue);
-    target.g = lerp(target.g, GRADIENT_SCRATCH.g, randomValue);
-    target.b = lerp(target.b, GRADIENT_SCRATCH.b, randomValue);
-    target.a = lerp(target.a, GRADIENT_SCRATCH.a, randomValue);
-    return target;
-  }
-  if (state === 3) {
-    evaluateGradient(gradient.minGradient, time, target);
-    evaluateGradient(gradient.maxGradient, time, GRADIENT_SCRATCH);
-    target.r = lerp(target.r, GRADIENT_SCRATCH.r, randomValue);
-    target.g = lerp(target.g, GRADIENT_SCRATCH.g, randomValue);
-    target.b = lerp(target.b, GRADIENT_SCRATCH.b, randomValue);
-    target.a = lerp(target.a, GRADIENT_SCRATCH.a, randomValue);
-    return target;
-  }
-  return serializedColor(ZERO_COLOR, target);
-}
-
-export function readNativeParticleSystem(value: unknown): NativeParticleSystemData | undefined {
+  originalIdentity?: Effect001ParticleSystemAssetRef["originalIdentity"],
+): NativeParticleSystemData | undefined {
   const root = record(value);
+  if (
+    originalIdentity &&
+    (root?.serializedFile !== originalIdentity.serializedFile || root?.pathId !== originalIdentity.pathId)
+  )
+    throw new Error("Simple Circle original particle identity changed");
   if (root?.type !== "ParticleSystem") return undefined;
   const data = record(root.data);
   const initial = record(data?.InitialModule);
   if (!data || !initial || initial.enabled !== true) return undefined;
+  const shape = record(data.ShapeModule);
+  if (originalIdentity) {
+    if (!shape || shape.enabled !== true || shape.type !== 10)
+      throw new Error("Simple Circle original Shape owner changed");
+    const radius = record(shape.radius),
+      arc = record(shape.arc),
+      rotation = record(shape.m_Rotation);
+    const speed = record(initial.startSpeed),
+      circleVelocity = record(data.VelocityModule),
+      limit = record(data.ClampVelocityModule);
+    const numeric = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value);
+    const modifier = record(circleVelocity?.speedModifier);
+    if (
+      !radius ||
+      radius.mode !== 0 ||
+      radius.spread !== 0 ||
+      !numeric(radius.value) ||
+      radius.value < 0 ||
+      !arc ||
+      arc.mode !== 0 ||
+      arc.spread !== 0 ||
+      !numeric(arc.value) ||
+      arc.value <= 0 ||
+      arc.value > 360 ||
+      !numeric(shape.radiusThickness) ||
+      shape.radiusThickness < 0 ||
+      shape.radiusThickness > 1 ||
+      !rotation ||
+      rotation.y !== 0 ||
+      rotation.z !== 0 ||
+      !numeric(rotation.x) ||
+      shape.alignToDirection !== false ||
+      shape.randomDirectionAmount !== 0 ||
+      shape.randomPositionAmount !== 0 ||
+      shape.sphericalDirectionAmount !== 0 ||
+      !speed ||
+      (speed.minMaxState !== 0 && speed.minMaxState !== 3) ||
+      !numeric(speed.scalar) ||
+      !numeric(speed.minScalar) ||
+      data.moveWithTransform !== 0 ||
+      data.scalingMode !== 1 ||
+      circleVelocity?.enabled !== true ||
+      circleVelocity.inWorldSpace !== false ||
+      !modifier ||
+      modifier.minMaxState !== 0 ||
+      modifier.scalar !== 1 ||
+      limit?.enabled !== true ||
+      limit.inWorldSpace !== false ||
+      limit.multiplyDragByParticleSize !== false ||
+      limit.multiplyDragByParticleVelocity !== false
+    )
+      throw new Error("Unsupported original Simple Circle particle contract");
+  }
   // Loading is the one-time point at which paying LUT construction and
   // validation cannot disturb a dense effect frame.
   prepareNativeCurveLuts(data);
+  const velocity = record(data.VelocityModule);
+  if (
+    velocity &&
+    [
+      "orbitalOffsetX",
+      "orbitalOffsetY",
+      "orbitalOffsetZ",
+      "orbitalX",
+      "orbitalY",
+      "orbitalZ",
+      "radial",
+    ].every((key) => knownPositiveZeroCurve(velocity[key]))
+  )
+    zeroOrbitRadialModules.add(velocity);
   return {
     raw: data,
     length: Math.max(0, finite(data.lengthInSec)),
@@ -777,14 +578,19 @@ function bitsToFloat(value: number): number {
   return view.getFloat32(0, true);
 }
 
-function bindingComponentCount(binding: NativeRecord): number {
+function bindingComponentCount(binding: NativeRecord, completeTransformBindings = false): number {
   const typeId = Math.round(finite(binding.typeID));
   const attribute = Math.round(finite(binding.attribute));
   if (typeId === 4 && attribute === ATTRIBUTE_TRANSFORM_POSITION) return 3;
+  if (completeTransformBindings && typeId === 4 && (attribute === 3 || attribute === 4)) return 3;
+  if (completeTransformBindings && typeId === 4 && attribute === 2) return 4;
   return 1;
 }
 
-export function readNativeAnimationClip(value: unknown): NativeAnimationClip | undefined {
+export function readNativeAnimationClip(
+  value: unknown,
+  options?: { completeTransformBindings?: boolean },
+): NativeAnimationClip | undefined {
   const root = record(value);
   if (root?.type !== "AnimationClip") return undefined;
   const data = record(root.data);
@@ -821,12 +627,13 @@ export function readNativeAnimationClip(value: unknown): NativeAnimationClip | u
   for (const rawBinding of array(bindingRoot?.genericBindings)) {
     const binding = record(rawBinding);
     if (!binding) continue;
-    const componentCount = bindingComponentCount(binding);
+    const componentCount = bindingComponentCount(binding, options?.completeTransformBindings);
     if (curveStart >= totalCurveCount) break;
     bindings.push({
       path: Math.round(finite(binding.path)) >>> 0,
       attribute: Math.round(finite(binding.attribute)) >>> 0,
       curveStart,
+      typeId: Math.round(finite(binding.typeID)),
       componentCount: Math.min(componentCount, totalCurveCount - curveStart),
     });
     curveStart += componentCount;
@@ -848,18 +655,55 @@ export function readNativeAnimationClip(value: unknown): NativeAnimationClip | u
     streamedCurveCount: curveCount,
     constantValues,
     frames,
+    curveFrames: indexNativeCurveFrames(frames),
     bindings,
     bindingLookup,
   };
 }
 
-function clipCurveValue(clip: NativeAnimationClip | undefined, curveIndex: number, time: number): number | undefined {
+function indexNativeCurveFrames(
+  frames: ReadonlyArray<NativeClipFrame>,
+): ReadonlyMap<number, ReadonlyArray<NativeClipFrame>> | undefined {
+  let previous = Number.NEGATIVE_INFINITY;
+  for (const frame of frames) {
+    if (Number.isNaN(frame.time) || frame.time < previous) return undefined;
+    previous = frame.time;
+  }
+  const indexed = new Map<number, NativeClipFrame[]>();
+  for (const frame of frames)
+    for (const curveIndex of frame.coefficients.keys()) {
+      let values = indexed.get(curveIndex);
+      if (!values) indexed.set(curveIndex, (values = []));
+      values.push(frame);
+    }
+  return indexed;
+}
+
+function clipCurveValue(
+  clip: NativeAnimationClip | undefined,
+  curveIndex: number,
+  time: number,
+): number | undefined {
   if (!clip) return undefined;
   if (curveIndex >= clip.streamedCurveCount) return clip.constantValues[curveIndex - clip.streamedCurveCount];
   let frame: NativeClipFrame | undefined;
-  for (const candidate of clip.frames) {
-    if (candidate.time > time) break;
-    if (candidate.coefficients.has(curveIndex)) frame = candidate;
+  if (clip.curveFrames && Number.isFinite(time)) {
+    const values = clip.curveFrames.get(curveIndex);
+    if (values) {
+      let left = 0,
+        right = values.length;
+      while (left < right) {
+        const middle = (left + right) >>> 1;
+        if (values[middle]!.time <= time) left = middle + 1;
+        else right = middle;
+      }
+      frame = values[left - 1];
+    }
+  } else {
+    for (const candidate of clip.frames) {
+      if (candidate.time > time) break;
+      if (candidate.coefficients.has(curveIndex)) frame = candidate;
+    }
   }
   const coefficients = frame?.coefficients.get(curveIndex);
   if (!frame || !coefficients) return undefined;
@@ -875,6 +719,23 @@ function clipBindingValue(
   component = 0,
 ): number | undefined {
   const binding = clip?.bindingLookup.get(path)?.get(attribute);
+  if (!binding || component >= binding.componentCount) return undefined;
+  return clipCurveValue(clip, binding.curveStart + component, time);
+}
+
+/** Read a native clip's authored scalar/vector component without changing its shared animation sampler. */
+export function nativeAnimationClipBindingValue(
+  clip: NativeAnimationClip | undefined,
+  path: number,
+  attribute: number,
+  time: number,
+  component = 0,
+  typeId?: number,
+): number | undefined {
+  if (typeId === undefined) return clipBindingValue(clip, path, attribute, time, component);
+  const binding = clip?.bindings.find(
+    (value) => value.path === path && value.attribute === attribute && value.typeId === typeId,
+  );
   if (!binding || component >= binding.componentCount) return undefined;
   return clipCurveValue(clip, binding.curveStart + component, time);
 }
@@ -900,21 +761,30 @@ function loadedParticleSystem(
   ref: Effect001ParticleSystemAssetRef,
 ): LoadedParticleSystem {
   const animationPath = ref.animationPath;
+  const hierarchy = ref.baseActiveHierarchy;
   return {
     ...data,
     ref,
     animationPathHash: animationPath ? unityStringHash(animationPath) : undefined,
-    animationPathHierarchy: animationPath ? animationPathHierarchy(animationPath) : EMPTY_PATH_HASHES,
+    animationPathHierarchy: hierarchy
+      ? hierarchy.map((entry) => unityStringHash(entry.path))
+      : animationPath ? animationPathHierarchy(animationPath) : EMPTY_PATH_HASHES,
+    baseActiveByPath: new Map(hierarchy?.map((entry) => [unityStringHash(entry.path), entry.active]) ?? []),
     nameHash: hash(ref.name),
+    motionSource: readNativeParticleMotionSource(data.raw),
     emissionBuffer: [],
     emissionPool: [],
   };
 }
 
-function particleSystemActiveAt(clip: NativeAnimationClip, paths: ReadonlyArray<number>, time: number): boolean {
-  return paths.every((path) => {
+function particleSystemActiveAt(
+  clip: NativeAnimationClip,
+  system: LoadedParticleSystem,
+  time: number,
+): boolean {
+  return system.animationPathHierarchy.every((path) => {
     const active = clipBindingValue(clip, path, ATTRIBUTE_ACTIVE, time);
-    return active === undefined || active >= 0.5;
+    return active === undefined ? (system.baseActiveByPath?.get(path) ?? true) : active >= 0.5;
   });
 }
 
@@ -929,8 +799,10 @@ function particleSystemPlayback(
   animation: NativeAnimationClip | undefined,
   effectAge: number,
 ): ParticlePlayback | undefined {
-  const path = system.ref.animationPath;
-  if (!path || !animation || animation.duration <= 0) return { age: effectAge, animationTimeOffset: 0 };
+  if (system.ref.rendererEnabled === false) return undefined;
+  if (!animation || animation.duration <= 0)
+    return system.animationPathHierarchy.every((path) => system.baseActiveByPath?.get(path) ?? true)
+      ? { age: effectAge, animationTimeOffset: 0 } : undefined;
   let cycleStart = 0;
   let animationTime = Math.max(0, effectAge);
   if (manifest.loopAnimation) {
@@ -939,14 +811,13 @@ function particleSystemPlayback(
   } else {
     animationTime = Math.min(animationTime, animation.duration);
   }
-  const paths = system.animationPathHierarchy;
-  if (!particleSystemActiveAt(animation, paths, animationTime)) return undefined;
+  if (!particleSystemActiveAt(animation, system, animationTime)) return undefined;
 
-  let active = particleSystemActiveAt(animation, paths, 0);
+  let active = particleSystemActiveAt(animation, system, 0);
   let activeStart = active ? 0 : undefined;
   for (const frame of animation.frames) {
     if (frame.time <= 0 || frame.time > animationTime) continue;
-    const nextActive = particleSystemActiveAt(animation, paths, frame.time);
+    const nextActive = particleSystemActiveAt(animation, system, frame.time);
     if (!active && nextActive) activeStart = frame.time;
     active = nextActive;
   }
@@ -956,11 +827,13 @@ function particleSystemPlayback(
   // the effect's activation; animated properties still sample the loop phase.
   if (
     manifest.loopAnimation &&
-    particleSystemActiveAt(animation, paths, 0) &&
-    particleSystemActiveAt(animation, paths, animation.duration) &&
+    particleSystemActiveAt(animation, system, 0) &&
+    particleSystemActiveAt(animation, system, animation.duration) &&
     animation.frames.every(
       (frame) =>
-        frame.time <= 0 || frame.time > animation.duration || particleSystemActiveAt(animation, paths, frame.time),
+        frame.time <= 0 ||
+        frame.time > animation.duration ||
+        particleSystemActiveAt(animation, system, frame.time),
     )
   )
     return { age: Math.max(0, effectAge), animationTimeOffset: 0 };
@@ -1006,7 +879,10 @@ function particleSystemHasAnimatedSimulationSpeed(
   animation: NativeAnimationClip | undefined,
 ): boolean {
   const path = system.animationPathHash;
-  return path !== undefined && animation?.bindingLookup.get(path)?.has(ATTRIBUTE_PARTICLE_SIMULATION_SPEED) === true;
+  return (
+    path !== undefined &&
+    animation?.bindingLookup.get(path)?.has(ATTRIBUTE_PARTICLE_SIMULATION_SPEED) === true
+  );
 }
 
 function particleSimulationClock(
@@ -1024,7 +900,8 @@ function particleSimulationClock(
     for (let start = 0; start < duration; start += EMISSION_STEP) {
       const step = Math.min(EMISSION_STEP, duration - start);
       simulated +=
-        particleSystemSimulationSpeedAt(system, manifest, animation, animationTimeOffset + start + step / 2) * step;
+        particleSystemSimulationSpeedAt(system, manifest, animation, animationTimeOffset + start + step / 2) *
+        step;
     }
     return Math.max(0, simulated - delay);
   };
@@ -1082,19 +959,25 @@ class ParticleQuadBatch {
   readonly material: ShaderMaterial;
   readonly mesh: Mesh<InstancedBufferGeometry, ShaderMaterial>;
 
-  private readonly center: InstancedBufferAttribute;
-  private readonly size: InstancedBufferAttribute;
-  private readonly color: InstancedBufferAttribute;
-  private readonly rotation: InstancedBufferAttribute;
-  private readonly pivot: InstancedBufferAttribute;
-  private readonly maxParticleSize: InstancedBufferAttribute;
-  private readonly renderMode: InstancedBufferAttribute;
-  private readonly tint: InstancedBufferAttribute;
+  private readonly instances: InstancedInterleavedBuffer;
+  private readonly center: InterleavedBufferAttribute;
+  private readonly size: InterleavedBufferAttribute;
+  private readonly color: InterleavedBufferAttribute;
+  private readonly rotation: InterleavedBufferAttribute;
+  private readonly pivot: InterleavedBufferAttribute;
+  private readonly maxParticleSize: InterleavedBufferAttribute;
+  private readonly renderMode: InterleavedBufferAttribute;
+  private readonly tint: InterleavedBufferAttribute;
   private readonly defaultTint: readonly [number, number, number, number];
   private readonly capacity: number;
   private cursor = 0;
 
-  constructor(name: string, capacity: number, texture: Texture, tint: readonly [number, number, number, number]) {
+  constructor(
+    name: string,
+    capacity: number,
+    texture: Texture,
+    tint: readonly [number, number, number, number],
+  ) {
     this.capacity = capacity;
     this.defaultTint = tint;
     this.geometry = new InstancedBufferGeometry();
@@ -1104,13 +987,17 @@ class ParticleQuadBatch {
     );
     this.geometry.setAttribute("uv", new BufferAttribute(new Float32Array([0, 0, 1, 0, 1, 1, 0, 1]), 2));
     this.geometry.setIndex([0, 1, 2, 0, 2, 3]);
-    this.center = new InstancedBufferAttribute(new Float32Array(capacity * 3), 3).setUsage(DynamicDrawUsage);
-    this.size = new InstancedBufferAttribute(new Float32Array(capacity * 2), 2).setUsage(DynamicDrawUsage);
-    this.color = new InstancedBufferAttribute(new Float32Array(capacity * 4), 4).setUsage(DynamicDrawUsage);
-    this.rotation = new InstancedBufferAttribute(new Float32Array(capacity), 1).setUsage(DynamicDrawUsage);
-    this.pivot = new InstancedBufferAttribute(new Float32Array(capacity * 2), 2).setUsage(DynamicDrawUsage);
-    this.maxParticleSize = new InstancedBufferAttribute(new Float32Array(capacity), 1).setUsage(DynamicDrawUsage);
-    this.renderMode = new InstancedBufferAttribute(new Float32Array(capacity), 1).setUsage(DynamicDrawUsage);
+    // One active-prefix upload retains every authored per-instance value.
+    this.instances = new InstancedInterleavedBuffer(new Float32Array(capacity * 18), 18).setUsage(
+      DynamicDrawUsage,
+    );
+    this.center = new InterleavedBufferAttribute(this.instances, 3, 0);
+    this.size = new InterleavedBufferAttribute(this.instances, 2, 3);
+    this.color = new InterleavedBufferAttribute(this.instances, 4, 5);
+    this.rotation = new InterleavedBufferAttribute(this.instances, 1, 9);
+    this.pivot = new InterleavedBufferAttribute(this.instances, 2, 10);
+    this.maxParticleSize = new InterleavedBufferAttribute(this.instances, 1, 12);
+    this.renderMode = new InterleavedBufferAttribute(this.instances, 1, 13);
     this.geometry.setAttribute("aCenter", this.center);
     this.geometry.setAttribute("aSize", this.size);
     this.geometry.setAttribute("aColor", this.color);
@@ -1118,7 +1005,7 @@ class ParticleQuadBatch {
     this.geometry.setAttribute("aPivot", this.pivot);
     this.geometry.setAttribute("aMaxParticleSize", this.maxParticleSize);
     this.geometry.setAttribute("aRenderMode", this.renderMode);
-    this.tint = new InstancedBufferAttribute(new Float32Array(capacity * 4), 4).setUsage(DynamicDrawUsage);
+    this.tint = new InterleavedBufferAttribute(this.instances, 4, 14);
     this.geometry.setAttribute("aTint", this.tint);
     this.geometry.instanceCount = 0;
     this.material = new ShaderMaterial({
@@ -1149,13 +1036,10 @@ class ParticleQuadBatch {
           // Compiled Custom/Mobile/MobileAddHdrColor GLES3 vertex program:
           //     vs_COLOR0 = in_COLOR0 * _TintColor * _TintColor * 2
           vColor = aColor * aTint * aTint * 2.0;
-          // Unity billboard modes use camera axes, the world XZ plane, or
-          // an upright world-Y quad turning horizontally towards the camera.
+          // Vertical billboards share the camera direction and retain world Y,
+          // matching the authored renderer and the other rendering backends.
           vec4 worldCenter = modelMatrix * vec4(aCenter, 1.0);
-          vec3 toCamera = cameraPosition - worldCenter.xyz;
-          vec2 horizontal = toCamera.xz;
-          float horizontalLength = max(length(horizontal), 0.000001);
-          vec3 right = vec3(horizontal.y, 0.0, -horizontal.x) / horizontalLength;
+          vec3 right;
           vec3 up = vec3(0.0, 1.0, 0.0);
           if (aRenderMode < 0.5) {
             right = vec3(viewMatrix[0][0], viewMatrix[1][0], viewMatrix[2][0]);
@@ -1163,6 +1047,16 @@ class ParticleQuadBatch {
           } else if (aRenderMode < 2.5) {
             right = vec3(1.0, 0.0, 0.0);
             up = vec3(0.0, 0.0, -1.0);
+          } else if (aRenderMode < 3.5) {
+            vec2 cameraBackward = vec2(viewMatrix[0][2], viewMatrix[2][2]);
+            float horizontalLength = length(cameraBackward);
+            right = horizontalLength > 0.0
+              ? vec3(cameraBackward.y, 0.0, -cameraBackward.x) / horizontalLength
+              : vec3(viewMatrix[0][0], viewMatrix[1][0], viewMatrix[2][0]);
+          } else {
+            vec2 horizontal = (cameraPosition - worldCenter.xyz).xz;
+            float horizontalLength = max(length(horizontal), 0.000001);
+            right = vec3(horizontal.y, 0.0, -horizontal.x) / horizontalLength;
           }
           // Clamp size at the particle centre, before the pivot offset.
           // Projecting the unbounded/pivot-shifted corners first can cross
@@ -1263,30 +1157,9 @@ class ParticleQuadBatch {
     this.geometry.instanceCount = this.cursor;
     this.mesh.visible = this.cursor > 0;
     if (this.cursor === 0) return;
-    this.center.clearUpdateRanges();
-    this.size.clearUpdateRanges();
-    this.color.clearUpdateRanges();
-    this.tint.clearUpdateRanges();
-    this.rotation.clearUpdateRanges();
-    this.pivot.clearUpdateRanges();
-    this.maxParticleSize.clearUpdateRanges();
-    this.renderMode.clearUpdateRanges();
-    this.center.addUpdateRange(0, this.cursor * 3);
-    this.size.addUpdateRange(0, this.cursor * 2);
-    this.color.addUpdateRange(0, this.cursor * 4);
-    this.tint.addUpdateRange(0, this.cursor * 4);
-    this.rotation.addUpdateRange(0, this.cursor);
-    this.pivot.addUpdateRange(0, this.cursor * 2);
-    this.maxParticleSize.addUpdateRange(0, this.cursor);
-    this.renderMode.addUpdateRange(0, this.cursor);
-    this.center.needsUpdate = true;
-    this.size.needsUpdate = true;
-    this.color.needsUpdate = true;
-    this.tint.needsUpdate = true;
-    this.rotation.needsUpdate = true;
-    this.pivot.needsUpdate = true;
-    this.maxParticleSize.needsUpdate = true;
-    this.renderMode.needsUpdate = true;
+    this.instances.clearUpdateRanges();
+    this.instances.addUpdateRange(0, this.cursor * this.instances.stride);
+    this.instances.needsUpdate = true;
   }
 
   setTexture(texture: Texture): void {
@@ -1309,11 +1182,12 @@ class EffectMeshBatch {
   readonly material: ShaderMaterial;
   readonly mesh: Mesh<InstancedBufferGeometry, ShaderMaterial>;
 
-  private readonly center: InstancedBufferAttribute;
-  private readonly scale: InstancedBufferAttribute;
-  private readonly color: InstancedBufferAttribute;
-  private readonly rotationX: InstancedBufferAttribute;
-  private readonly tint: InstancedBufferAttribute;
+  private readonly instances: InstancedInterleavedBuffer;
+  private readonly center: InterleavedBufferAttribute;
+  private readonly scale: InterleavedBufferAttribute;
+  private readonly color: InterleavedBufferAttribute;
+  private readonly rotationX: InterleavedBufferAttribute;
+  private readonly tint: InterleavedBufferAttribute;
   private readonly defaultTint: readonly [number, number, number, number];
   private readonly capacity: number;
   private cursor = 0;
@@ -1338,15 +1212,19 @@ class EffectMeshBatch {
     this.geometry.setAttribute("position", position.clone());
     if (uv) this.geometry.setAttribute("uv", uv.clone());
     if (source.index) this.geometry.setIndex(source.index.clone());
-    this.center = new InstancedBufferAttribute(new Float32Array(capacity * 3), 3).setUsage(DynamicDrawUsage);
-    this.scale = new InstancedBufferAttribute(new Float32Array(capacity * 3), 3).setUsage(DynamicDrawUsage);
-    this.color = new InstancedBufferAttribute(new Float32Array(capacity * 4), 4).setUsage(DynamicDrawUsage);
-    this.rotationX = new InstancedBufferAttribute(new Float32Array(capacity), 1).setUsage(DynamicDrawUsage);
+    // One active-prefix upload retains every authored per-instance value.
+    this.instances = new InstancedInterleavedBuffer(new Float32Array(capacity * 15), 15).setUsage(
+      DynamicDrawUsage,
+    );
+    this.center = new InterleavedBufferAttribute(this.instances, 3, 0);
+    this.scale = new InterleavedBufferAttribute(this.instances, 3, 3);
+    this.color = new InterleavedBufferAttribute(this.instances, 4, 6);
+    this.rotationX = new InterleavedBufferAttribute(this.instances, 1, 10);
     this.geometry.setAttribute("aCenter", this.center);
     this.geometry.setAttribute("aScale", this.scale);
     this.geometry.setAttribute("aColor", this.color);
     this.geometry.setAttribute("aRotationX", this.rotationX);
-    this.tint = new InstancedBufferAttribute(new Float32Array(capacity * 4), 4).setUsage(DynamicDrawUsage);
+    this.tint = new InterleavedBufferAttribute(this.instances, 4, 11);
     this.geometry.setAttribute("aTint", this.tint);
     this.geometry.instanceCount = 0;
     this.material = new ShaderMaterial({
@@ -1486,21 +1364,9 @@ class EffectMeshBatch {
     this.geometry.instanceCount = this.cursor;
     this.mesh.visible = this.cursor > 0;
     if (this.cursor === 0) return;
-    this.center.clearUpdateRanges();
-    this.scale.clearUpdateRanges();
-    this.color.clearUpdateRanges();
-    this.tint.clearUpdateRanges();
-    this.rotationX.clearUpdateRanges();
-    this.center.addUpdateRange(0, this.cursor * 3);
-    this.scale.addUpdateRange(0, this.cursor * 3);
-    this.color.addUpdateRange(0, this.cursor * 4);
-    this.tint.addUpdateRange(0, this.cursor * 4);
-    this.rotationX.addUpdateRange(0, this.cursor);
-    this.center.needsUpdate = true;
-    this.scale.needsUpdate = true;
-    this.color.needsUpdate = true;
-    this.tint.needsUpdate = true;
-    this.rotationX.needsUpdate = true;
+    this.instances.clearUpdateRanges();
+    this.instances.addUpdateRange(0, this.cursor * this.instances.stride);
+    this.instances.needsUpdate = true;
   }
 
   setTexture(texture: Texture): void {
@@ -1550,23 +1416,25 @@ function createSlicedSpriteGeometry(): BufferGeometry {
 
 function createWallGeometry(): BufferGeometry {
   const positions = [
-    -0.966932595, 0, -0.00000006, -0.966932595, 2.408502817, 0.000000014, -0.983466268, 2.408502817, -0.00443018,
-    -0.983466268, 0, -0.004430255, -0.995569766, 2.408502817, -0.016533695, -0.995569766, -0.000000001, -0.01653377, -1,
-    2.408502817, -0.033067405, -1, -0.000000001, -0.03306748, 1, -0.000000001, -0.03306748, 1, 2.408502817,
-    -0.033067405, 0.995569766, 2.408502817, -0.016533695, 0.995569766, -0.000000001, -0.01653377, 0.983466268,
-    2.408502817, -0.00443018, 0.983466268, 0, -0.004430255, 0.966932595, 2.408502817, 0.000000014, 0.966932595, 0,
-    -0.00000006, -1, -0.000000044, -1, -1, -0.000000001, -0.03306748, -1, 2.408502817, -0.033067405, -1, 2.408502817,
-    -1, -0.966932595, 0, -0.00000006, 0.966932595, 0, -0.00000006, 0.966932595, 2.408502817, 0.000000014, -0.966932595,
-    2.408502817, 0.000000014, 1, -0.000000001, -0.03306748, 1, -0.000000044, -1, 1, 2.408502817, -1, 1, 2.408502817,
-    -0.033067405,
+    -0.966932595, 0, -0.00000006, -0.966932595, 2.408502817, 0.000000014, -0.983466268, 2.408502817,
+    -0.00443018, -0.983466268, 0, -0.004430255, -0.995569766, 2.408502817, -0.016533695, -0.995569766,
+    -0.000000001, -0.01653377, -1, 2.408502817, -0.033067405, -1, -0.000000001, -0.03306748, 1, -0.000000001,
+    -0.03306748, 1, 2.408502817, -0.033067405, 0.995569766, 2.408502817, -0.016533695, 0.995569766,
+    -0.000000001, -0.01653377, 0.983466268, 2.408502817, -0.00443018, 0.983466268, 0, -0.004430255,
+    0.966932595, 2.408502817, 0.000000014, 0.966932595, 0, -0.00000006, -1, -0.000000044, -1, -1,
+    -0.000000001, -0.03306748, -1, 2.408502817, -0.033067405, -1, 2.408502817, -1, -0.966932595, 0,
+    -0.00000006, 0.966932595, 0, -0.00000006, 0.966932595, 2.408502817, 0.000000014, -0.966932595,
+    2.408502817, 0.000000014, 1, -0.000000001, -0.03306748, 1, -0.000000044, -1, 1, 2.408502817, -1, 1,
+    2.408502817, -0.033067405,
   ];
   const uvs = [
-    0.2742908, 0.003899515, 0.2742908, 0.999999642, 0.257075697, 0.999999642, 0.257075697, 0.003899515, 0.241160661,
-    0.999999642, 0.241160661, 0.003899515, 0.224267989, 1, 0.224267989, 0.003899902, 0.770728827, 0.003899515,
-    0.770728827, 0.999999642, 0.756421268, 0.999999642, 0.756421268, 0.003899515, 0.74077493, 0.999999642, 0.74077493,
-    0.003899515, 0.725790977, 0.999999642, 0.725790977, 0.003899515, 0, 0.003899515, 0.224267989, 0.003899902,
-    0.224267989, 1, 0, 1, 0.2742908, 0.003899515, 0.725790977, 0.003899515, 0.725790977, 0.999999642, 0.2742908,
-    0.999999642, 0.770728827, 0.003899515, 1, 0.003899515, 1, 1, 0.770728827, 0.999999642,
+    0.2742908, 0.003899515, 0.2742908, 0.999999642, 0.257075697, 0.999999642, 0.257075697, 0.003899515,
+    0.241160661, 0.999999642, 0.241160661, 0.003899515, 0.224267989, 1, 0.224267989, 0.003899902, 0.770728827,
+    0.003899515, 0.770728827, 0.999999642, 0.756421268, 0.999999642, 0.756421268, 0.003899515, 0.74077493,
+    0.999999642, 0.74077493, 0.003899515, 0.725790977, 0.999999642, 0.725790977, 0.003899515, 0, 0.003899515,
+    0.224267989, 0.003899902, 0.224267989, 1, 0, 1, 0.2742908, 0.003899515, 0.725790977, 0.003899515,
+    0.725790977, 0.999999642, 0.2742908, 0.999999642, 0.770728827, 0.003899515, 1, 0.003899515, 1, 1,
+    0.770728827, 0.999999642,
   ];
   // effect.bundle vertices are Unity world-local coordinates. Reflect every
   // authored Z component together with the rest of the scene.
@@ -1575,8 +1443,8 @@ function createWallGeometry(): BufferGeometry {
   geometry.setAttribute("position", new BufferAttribute(new Float32Array(positions), 3));
   geometry.setAttribute("uv", new BufferAttribute(new Float32Array(uvs), 2));
   geometry.setIndex([
-    0, 1, 2, 0, 2, 3, 3, 2, 4, 3, 4, 5, 5, 4, 6, 5, 6, 7, 8, 9, 10, 8, 10, 11, 11, 10, 12, 11, 12, 13, 13, 12, 14, 13,
-    14, 15, 16, 17, 18, 16, 18, 19, 20, 21, 22, 20, 22, 23, 24, 25, 26, 24, 26, 27,
+    0, 1, 2, 0, 2, 3, 3, 2, 4, 3, 4, 5, 5, 4, 6, 5, 6, 7, 8, 9, 10, 8, 10, 11, 11, 10, 12, 11, 12, 13, 13, 12,
+    14, 13, 14, 15, 16, 17, 18, 16, 18, 19, 20, 21, 22, 20, 22, 23, 24, 25, 26, 24, 26, 27,
   ]);
   return geometry;
 }
@@ -1597,14 +1465,24 @@ export function nativeBillboardQuad(
   viewMatrix: { elements: ArrayLike<number> },
   projectionScaleY: number,
 ): NativeWorldQuad {
-  const toCameraX = cameraPosition.x - trace.x;
-  const toCameraZ = cameraPosition.z - trace.z;
-  const horizontalLength = Math.max(Math.hypot(toCameraX, toCameraZ), 0.000001);
-  const rightX = toCameraZ / horizontalLength;
-  const rightZ = -toCameraX / horizontalLength;
   const e = viewMatrix.elements;
   const mode = trace.renderMode ?? 3;
-  const right = mode === 0 ? [e[0]!, e[4]!, e[8]!] : mode === 2 ? [1, 0, 0] : [rightX, 0, rightZ];
+  let right: number[];
+  if (mode === 0) right = [e[0]!, e[4]!, e[8]!];
+  else if (mode === 2) right = [1, 0, 0];
+  else if (mode === 3) {
+    // Three reflects authored Z: the camera backward row supplies the same
+    // world-Y-locked basis as cross(worldUp, cameraForward) in authored space.
+    const horizontalLength = Math.hypot(e[2]!, e[10]!);
+    right = horizontalLength > 0
+      ? [e[10]! / horizontalLength, 0, -e[2]! / horizontalLength]
+      : [e[0]!, e[4]!, e[8]!];
+  } else {
+    const toCameraX = cameraPosition.x - trace.x;
+    const toCameraZ = cameraPosition.z - trace.z;
+    const horizontalLength = Math.max(Math.hypot(toCameraX, toCameraZ), 0.000001);
+    right = [toCameraZ / horizontalLength, 0, -toCameraX / horizontalLength];
+  }
   const up = mode === 0 ? [e[1]!, e[5]!, e[9]!] : mode === 2 ? [0, 0, -1] : [0, 1, 0];
   const viewZ = e[2]! * trace.x + e[6]! * trace.y + e[10]! * trace.z + e[14]!;
   const diameter = Math.max(Math.abs(trace.sizeX), Math.abs(trace.sizeY));
@@ -1631,7 +1509,10 @@ export function nativeBillboardQuad(
   };
 }
 
-const NATIVE_MESH_QUADS = new Map<NativeMeshTrace["kind"], ReadonlyArray<{ position: number[][]; uv: number[][] }>>();
+const NATIVE_MESH_QUADS = new Map<
+  NativeMeshTrace["kind"],
+  ReadonlyArray<{ position: number[][]; uv: number[][] }>
+>();
 
 function meshQuads(kind: NativeMeshTrace["kind"]): ReadonlyArray<{ position: number[][]; uv: number[][] }> {
   let quads = NATIVE_MESH_QUADS.get(kind);
@@ -1687,7 +1568,13 @@ export function nativeMeshQuads(trace: NativeMeshTrace): NativeWorldQuad[] {
     const z = (pz! - pivot[2]!) * trace.scaleZ;
     if (trace.kind === "frame") {
       const slice = (tag: number, scale: number, border: number): number =>
-        tag < -1 ? -scale * 0.5 : tag < 0 ? -scale * 0.5 + border : tag < 1 ? scale * 0.5 - border : scale * 0.5;
+        tag < -1
+          ? -scale * 0.5
+          : tag < 0
+            ? -scale * 0.5 + border
+            : tag < 1
+              ? scale * 0.5 - border
+              : scale * 0.5;
       x = slice(px!, trace.scaleX, FRAME_SLICE_BORDER[0]);
       y = slice(py!, trace.scaleY, FRAME_SLICE_BORDER[1]);
     }
@@ -1723,7 +1610,11 @@ function shapePosition(
   seed: number,
   nativeWidth: number,
   target: [number, number, number],
+  initialDirection: [number, number, number],
 ): void {
+  initialDirection[0] = 0;
+  initialDirection[1] = 0;
+  initialDirection[2] = 0;
   const shape = record(system.raw.ShapeModule);
   if (!shape || shape.enabled !== true) {
     target[0] = 0;
@@ -1742,7 +1633,23 @@ function shapePosition(
   let x: number;
   let y: number;
   let z: number;
-  if (type === 16) {
+  if (type === 10) {
+    const angle = (random(seed + 3) * finite(record(shape.arc)?.value) * Math.PI) / 180;
+    const radius = finite(record(shape.radius)?.value),
+      inner = 1 - finite(shape.radiusThickness);
+    const radialDistance = radius * Math.sqrt(inner * inner + (1 - inner * inner) * random(seed + 5));
+    const directionX = radialDistance > 0 ? Math.cos(angle) : 1;
+    const directionY = radialDistance > 0 ? Math.sin(angle) : 0;
+    x = Math.cos(angle) * radialDistance * width;
+    y = Math.sin(angle) * radialDistance * height;
+    z = 0;
+    // Shape.scale changes the birth ellipse; it does not mirror or stretch the radial direction.
+    const rotation = record(shape.m_Rotation),
+      rx = (finite(rotation?.x) * Math.PI) / 180;
+    initialDirection[0] = directionX;
+    initialDirection[1] = directionY * Math.cos(rx);
+    initialDirection[2] = directionY * Math.sin(rx);
+  } else if (type === 16) {
     const perimeter = random(seed + 3) * Math.max(Number.EPSILON, 2 * (width + height));
     if (perimeter < width) {
       x = -width / 2 + perimeter;
@@ -1782,44 +1689,91 @@ function shapePosition(
   target[2] = z + finite(offset?.z);
 }
 
-function integratedVelocity(
+/** Only literal constant states are independent of the integration midpoint. */
+function timeIndependentCurveValue(value: unknown, curveRandom: number): number | undefined {
+  const curve = record(value);
+  if (!curve || (curve.minMaxState !== 0 && curve.minMaxState !== 3)) return undefined;
+  return evaluateNativeMinMaxCurve(value, 0, curveRandom);
+}
+
+function integratedUnconstrainedVelocity(
   system: LoadedParticleSystem,
   particleAge: number,
   lifetime: number,
   curveRandom: number,
   initialPosition: readonly [number, number, number],
+  initialVelocity: readonly [number, number, number],
   target: [number, number, number],
 ): void {
   const velocity = record(system.raw.VelocityModule);
-  const limiter = record(system.raw.ClampVelocityModule);
   const initial = record(system.raw.InitialModule);
   const gravityCurve = initial?.gravityModifier;
   const gravityEnabled =
     evaluateNativeMinMaxCurve(gravityCurve, 0.5, curveRandom) !== 0 ||
     evaluateNativeMinMaxCurve(gravityCurve, 1, curveRandom) !== 0;
-  if ((velocity?.enabled !== true && !gravityEnabled) || particleAge <= 0) {
+  const hasInitialVelocity = initialVelocity[0] !== 0 || initialVelocity[1] !== 0 || initialVelocity[2] !== 0;
+  if ((velocity?.enabled !== true && !gravityEnabled && !hasInitialVelocity) || particleAge <= 0) {
     target[0] = 0;
     target[1] = 0;
     target[2] = 0;
     return;
   }
-  // TimeManager in the supplied data.unity3d stores 0.029999999329447746.
-  // Limit/drag feed back into base velocity; retain that state across steps.
-  const steps =
-    limiter?.enabled === true ? Math.min(4096, Math.max(1, Math.ceil(particleAge / 0.029999999329447746))) : 1;
-  const delta = particleAge / steps;
+  const delta = particleAge;
+  const velocityXValue =
+    velocity?.enabled === true ? timeIndependentCurveValue(velocity.x, curveRandom) : undefined;
+  const velocityYValue =
+    velocity?.enabled === true ? timeIndependentCurveValue(velocity.y, curveRandom) : undefined;
+  const velocityZValue =
+    velocity?.enabled === true ? timeIndependentCurveValue(velocity.z, curveRandom) : undefined;
+  const speedModifierValue =
+    velocity?.enabled === true && velocity.speedModifier
+      ? timeIndependentCurveValue(velocity.speedModifier, curveRandom)
+      : undefined;
+  const gravityValue = timeIndependentCurveValue(gravityCurve, curveRandom);
   let px = initialPosition[0];
   let py = initialPosition[1];
   let pz = initialPosition[2];
-  let baseVelocityX = 0;
-  let baseVelocityY = 0;
-  let baseVelocityZ = 0;
-  for (let step = 0; step < steps; step += 1) {
-    const normalized = clamp(((step + 0.5) * delta) / Math.max(Number.EPSILON, lifetime));
-    let vx = velocity?.enabled === true ? evaluateNativeMinMaxCurve(velocity.x, normalized, curveRandom) : 0;
-    let vy = velocity?.enabled === true ? evaluateNativeMinMaxCurve(velocity.y, normalized, curveRandom) : 0;
-    let vz = velocity?.enabled === true ? evaluateNativeMinMaxCurve(velocity.z, normalized, curveRandom) : 0;
-    if (velocity?.enabled === true) {
+  let baseVelocityX = initialVelocity[0];
+  let baseVelocityY = initialVelocity[1];
+  let baseVelocityZ = initialVelocity[2];
+  const normalized = clamp((0.5 * delta) / Math.max(Number.EPSILON, lifetime));
+  let vx =
+    velocity?.enabled === true
+      ? (velocityXValue ?? evaluateNativeMinMaxCurve(velocity.x, normalized, curveRandom))
+      : 0;
+  let vy =
+    velocity?.enabled === true
+      ? (velocityYValue ?? evaluateNativeMinMaxCurve(velocity.y, normalized, curveRandom))
+      : 0;
+  let vz =
+    velocity?.enabled === true
+      ? (velocityZValue ?? evaluateNativeMinMaxCurve(velocity.z, normalized, curveRandom))
+      : 0;
+  if (velocity?.enabled === true) {
+    if (
+      zeroOrbitRadialModules.has(velocity) &&
+      Number.isFinite(px) &&
+      Number.isFinite(py) &&
+      Number.isFinite(pz)
+    ) {
+      // Preserve the original signed-zero additions without evaluating seven known-zero curves.
+      const relativeX = px - 0,
+        relativeY = py - 0,
+        relativeZ = pz - 0;
+      vx += 0 * relativeZ - 0 * relativeY;
+      vy += 0 * relativeX - 0 * relativeZ;
+      vz += 0 * relativeY - 0 * relativeX;
+      // Away from the tiny origin neighbourhood, any component >epsilon proves hypot >epsilon.
+      // Near zero retain the exact threshold; sign(x)*0 equals (x/positiveLength)*0.
+      if (
+        Math.max(Math.abs(relativeX), Math.abs(relativeY), Math.abs(relativeZ)) > Number.EPSILON ||
+        Math.hypot(relativeX, relativeY, relativeZ) > Number.EPSILON
+      ) {
+        vx += Math.sign(relativeX) * 0;
+        vy += Math.sign(relativeY) * 0;
+        vz += Math.sign(relativeZ) * 0;
+      }
+    } else {
       const offsetX = evaluateNativeMinMaxCurve(velocity.orbitalOffsetX, normalized, curveRandom);
       const offsetY = evaluateNativeMinMaxCurve(velocity.orbitalOffsetY, normalized, curveRandom);
       const offsetZ = evaluateNativeMinMaxCurve(velocity.orbitalOffsetZ, normalized, curveRandom);
@@ -1839,59 +1793,22 @@ function integratedVelocity(
         vy += (relativeY / radialLength) * radial;
         vz += (relativeZ / radialLength) * radial;
       }
-      const speedModifier = velocity.speedModifier
-        ? evaluateNativeMinMaxCurve(velocity.speedModifier, normalized, curveRandom)
-        : 1;
-      vx *= speedModifier;
-      vy *= speedModifier;
-      vz *= speedModifier;
     }
-    const gravity = evaluateNativeMinMaxCurve(gravityCurve, normalized, curveRandom);
-    baseVelocityY -= 9.81 * gravity * delta;
-    const addedX = vx,
-      addedY = vy,
-      addedZ = vz;
-    vx += baseVelocityX;
-    vy += baseVelocityY;
-    vz += baseVelocityZ;
-    if (limiter?.enabled === true) {
-      // ClampVelocityModule::Update 0x12ecfac: 1 - pow(1 - dampen, abs(dt) * 30).
-      const dampen = 1 - Math.pow(1 - clamp(finite(limiter.dampen)), Math.abs(delta) * 30);
-      if (limiter.separateAxis === true) {
-        const limitX = Math.max(0, evaluateNativeMinMaxCurve(limiter.x, normalized, curveRandom));
-        const limitY = Math.max(0, evaluateNativeMinMaxCurve(limiter.y, normalized, curveRandom));
-        const limitZ = Math.max(0, evaluateNativeMinMaxCurve(limiter.z, normalized, curveRandom));
-        vx = Math.sign(vx) * lerp(Math.abs(vx), Math.min(Math.abs(vx), limitX), dampen);
-        vy = Math.sign(vy) * lerp(Math.abs(vy), Math.min(Math.abs(vy), limitY), dampen);
-        vz = Math.sign(vz) * lerp(Math.abs(vz), Math.min(Math.abs(vz), limitZ), dampen);
-      } else {
-        const limit = Math.max(0, evaluateNativeMinMaxCurve(limiter.magnitude, normalized, curveRandom));
-        const speed = Math.hypot(vx, vy, vz);
-        if (speed > limit && speed > 0) {
-          const limitedSpeed = lerp(speed, limit, dampen);
-          vx *= limitedSpeed / speed;
-          vy *= limitedSpeed / speed;
-          vz *= limitedSpeed / speed;
-        }
-      }
-      // 0x12ed720..0x12ed778 subtracts drag * dt from speed, then writes
-      // totalVelocity - the VelocityModule contribution back to base velocity.
-      // effect001 has both size/velocity multipliers disabled.
-      const drag = Math.max(0, evaluateNativeMinMaxCurve(limiter.drag, normalized, curveRandom));
-      const speed = Math.hypot(vx, vy, vz);
-      const dragBySpeed = limiter.multiplyDragByParticleVelocity === true ? speed * speed : 1;
-      const dragFactor = speed > 0 ? Math.max(0, speed - drag * dragBySpeed * delta) / speed : 0;
-      vx *= dragFactor;
-      vy *= dragFactor;
-      vz *= dragFactor;
-      baseVelocityX = vx - addedX;
-      baseVelocityY = vy - addedY;
-      baseVelocityZ = vz - addedZ;
-    }
-    px += vx * delta;
-    py += vy * delta;
-    pz += vz * delta;
+    const speedModifier = velocity.speedModifier
+      ? (speedModifierValue ?? evaluateNativeMinMaxCurve(velocity.speedModifier, normalized, curveRandom))
+      : 1;
+    vx *= speedModifier;
+    vy *= speedModifier;
+    vz *= speedModifier;
   }
+  const gravity = gravityValue ?? evaluateNativeMinMaxCurve(gravityCurve, normalized, curveRandom);
+  baseVelocityY -= 9.81 * gravity * delta;
+  vx += baseVelocityX;
+  vy += baseVelocityY;
+  vz += baseVelocityZ;
+  px += vx * delta;
+  py += vy * delta;
+  pz += vz * delta;
   target[0] = px - initialPosition[0];
   target[1] = py - initialPosition[1];
   target[2] = pz - initialPosition[2];
@@ -1947,23 +1864,54 @@ function sampleParticle(
   const rotationRandom = random(seed + 29);
   const colorRandom = random(seed + 37);
   const lifetime = Math.max(0, evaluateNativeMinMaxCurve(initial.startLifetime, 0, lifetimeRandom));
-  const age = currentSimulationTime - emission.simulationTime;
+  const age = currentSimulationTime - (emission.motion?.birthTime ?? emission.simulationTime);
   if (lifetime <= 0 || age < 0 || age >= lifetime) return undefined;
   const normalized = clamp(age / lifetime);
-  shapePosition(system, seed, nativeWidth, SHAPE_POSITION_SCRATCH);
-  integratedVelocity(system, age, lifetime, velocityRandom, SHAPE_POSITION_SCRATCH, VELOCITY_POSITION_SCRATCH);
+  if (!emission.motion) {
+    shapePosition(
+      system,
+      seed,
+      emission.shapeBirthWidth ?? nativeWidth,
+      SHAPE_POSITION_SCRATCH,
+      SHAPE_INITIAL_VELOCITY_SCRATCH,
+    );
+    if (record(system.raw.ShapeModule)?.enabled === true && record(system.raw.ShapeModule)?.type === 10) {
+      // The actual eight Circle sources use constant/two-constant start speeds, sampled once at birth.
+      const startSpeed = evaluateNativeMinMaxCurve(initial.startSpeed, 0, random(seed + 43));
+      for (let axis = 0; axis < 3; axis++)
+        SHAPE_INITIAL_VELOCITY_SCRATCH[axis] = SHAPE_INITIAL_VELOCITY_SCRATCH[axis]! * startSpeed;
+    }
+    integratedUnconstrainedVelocity(
+      system,
+      age,
+      lifetime,
+      velocityRandom,
+      SHAPE_POSITION_SCRATCH,
+      SHAPE_INITIAL_VELOCITY_SCRATCH,
+      VELOCITY_POSITION_SCRATCH,
+    );
+  }
   // SetWidth writes the wall Transform.localScale.x, replacing its serialized
   // prefab value 4.9. Applying both would multiply the native width twice.
-  const transformScale = system.ref.renderer === "wallMesh" ? UNIT_SCALE : (system.ref.localScale ?? UNIT_SCALE);
+  const transformScale =
+    system.ref.renderer === "wallMesh" ? UNIT_SCALE : (system.ref.localScale ?? UNIT_SCALE);
   PARTICLE_SAMPLE_SCRATCH.x =
-    (emission.originX + SHAPE_POSITION_SCRATCH[0] + VELOCITY_POSITION_SCRATCH[0]) * transformScale[0];
+    (emission.motion
+      ? emission.originX + emission.motion.x
+      : emission.originX + SHAPE_POSITION_SCRATCH[0] + VELOCITY_POSITION_SCRATCH[0]) * transformScale[0];
   PARTICLE_SAMPLE_SCRATCH.y =
-    (emission.originY + SHAPE_POSITION_SCRATCH[1] + VELOCITY_POSITION_SCRATCH[1]) * transformScale[1];
+    (emission.motion
+      ? emission.originY + emission.motion.y
+      : emission.originY + SHAPE_POSITION_SCRATCH[1] + VELOCITY_POSITION_SCRATCH[1]) * transformScale[1];
   PARTICLE_SAMPLE_SCRATCH.z =
-    (emission.originZ + SHAPE_POSITION_SCRATCH[2] + VELOCITY_POSITION_SCRATCH[2]) * transformScale[2];
+    (emission.motion
+      ? emission.originZ + emission.motion.z
+      : emission.originZ + SHAPE_POSITION_SCRATCH[2] + VELOCITY_POSITION_SCRATCH[2]) * transformScale[2];
   const baseSize = evaluateNativeMinMaxCurve(initial.startSize, 0, sizeRandom);
-  const baseY = initial.size3D === true ? evaluateNativeMinMaxCurve(initial.startSizeY, 0, sizeRandom) : baseSize;
-  const baseZ = initial.size3D === true ? evaluateNativeMinMaxCurve(initial.startSizeZ, 0, sizeRandom) : baseSize;
+  const baseY =
+    initial.size3D === true ? evaluateNativeMinMaxCurve(initial.startSizeY, 0, sizeRandom) : baseSize;
+  const baseZ =
+    initial.size3D === true ? evaluateNativeMinMaxCurve(initial.startSizeZ, 0, sizeRandom) : baseSize;
   const sizeModule = record(system.raw.SizeModule);
   let sizeX = startSizeXOverride ?? baseSize;
   let sizeY = baseY;
@@ -1974,11 +1922,18 @@ function sampleParticle(
     sizeY *= evaluateNativeMinMaxCurve(separate ? sizeModule.y : sizeModule.curve, normalized, sizeRandom);
     sizeZ *= evaluateNativeMinMaxCurve(separate ? sizeModule.z : sizeModule.curve, normalized, sizeRandom);
   }
-  const initialColor = evaluateNativeMinMaxGradient(initial.startColor, 0, colorRandom, PARTICLE_COLOR_SCRATCH);
+  const initialColor = evaluateNativeMinMaxGradient(
+    initial.startColor,
+    0,
+    colorRandom,
+    PARTICLE_COLOR_SCRATCH,
+  );
   // Bad clips override the initial min/max colours. These bindings are
   // constant in effect001; sample at birth so later particles retain theirs.
-  const birthTime = animationTimeOffset + emission.simulationTime / system.simulationSpeed;
+  const birthTime =
+    animationTimeOffset + (emission.motion?.birthTime ?? emission.simulationTime) / system.simulationSpeed;
   applyAnimatedStartColor(system, animation, birthTime, colorRandom, initialColor);
+  quantizeParticleColor(initialColor);
 
   const colorModule = record(system.raw.ColorModule);
   if (colorModule?.enabled === true) {
@@ -1993,6 +1948,7 @@ function sampleParticle(
     initialColor.b *= lifetimeColor.b;
     initialColor.a *= lifetimeColor.a;
   }
+  quantizeParticleColor(initialColor);
   const rotation = evaluateNativeMinMaxCurve(initial.startRotation, 0, rotationRandom);
   const rotationModule = record(system.raw.RotationModule);
   const rotationOverLifetime =
@@ -2025,7 +1981,9 @@ function movementAt(
   }
   // An explicitly separate emitter controller loops. Directional flick uses
   // its current one-shot judgement clip and holds the last keyed transform.
-  const animationTime = prefab.distanceAnimation ? realTime % clip.duration : clamp(realTime, 0, clip.duration);
+  const animationTime = prefab.distanceAnimation
+    ? realTime % clip.duration
+    : clamp(realTime, 0, clip.duration);
   nativeAnimationClipPosition(clip, path, animationTime, target);
 }
 
@@ -2037,12 +1995,20 @@ function appendEmission(
   originZ: number,
   index: number,
 ): void {
-  const emission = system.emissionPool.pop() ?? { simulationTime: 0, originX: 0, originY: 0, originZ: 0, index: 0 };
+  const emission = system.emissionPool.pop() ?? {
+    simulationTime: 0,
+    originX: 0,
+    originY: 0,
+    originZ: 0,
+    index: 0,
+  };
   emission.simulationTime = simulationTime;
   emission.originX = originX;
   emission.originY = originY;
   emission.originZ = originZ;
   emission.index = index;
+  emission.shapeBirthWidth = undefined;
+  emission.motion = undefined;
   const result = system.emissionBuffer;
   const capacity = system.maxParticles;
   if (capacity <= 0) {
@@ -2094,6 +2060,38 @@ function compareEmission(left: ParticleEmission, right: ParticleEmission): numbe
   return left.simulationTime - right.simulationTime || left.index - right.index;
 }
 
+function captureEmissionShapeWidths(
+  caches: Map<LoadedParticleSystem, ParticleShapeBirthWidths>,
+  system: LoadedParticleSystem,
+  emissions: ReadonlyArray<ParticleEmission>,
+  age: number,
+  seed: number,
+  width: number,
+): void {
+  if (system.ref.shapeWidthOffset === undefined) return;
+  let state = caches.get(system);
+  if (!state) {
+    state = { seed, lastAge: age, epoch: 0, widths: new Map() };
+    caches.set(system, state);
+  } else if (state.seed !== seed || age < state.lastAge) {
+    state.seed = seed;
+    state.widths.clear();
+  }
+  state.lastAge = age;
+  const epoch = ++state.epoch;
+  // ShapeModule.scale affects new births. Local-space particles retain their
+  // birth shape while the prefab's current Transform continues to move/scale.
+  for (const emission of emissions) {
+    let birth = state.widths.get(emission.index);
+    if (!birth) {
+      birth = { width, lastSeen: epoch };
+      state.widths.set(emission.index, birth);
+    } else birth.lastSeen = epoch;
+    emission.shapeBirthWidth = birth.width;
+  }
+  for (const [index, birth] of state.widths) if (birth.lastSeen !== epoch) state.widths.delete(index);
+}
+
 function emissionEvents(
   system: LoadedParticleSystem,
   prefab: LoadedPrefab,
@@ -2116,7 +2114,8 @@ function emissionEvents(
   const emission = record(system.raw.EmissionModule);
   if (!emission || emission.enabled !== true) return result;
   let emissionIndex = 0;
-  const cycleCount = system.looping && system.length > 0 ? Math.floor(simulationDuration / system.length) + 1 : 1;
+  const cycleCount =
+    system.looping && system.length > 0 ? Math.floor(simulationDuration / system.length) + 1 : 1;
   for (let cycle = 0; cycle < cycleCount; cycle += 1) {
     const cycleStart = cycle * system.length;
     for (const rawBurst of array(emission.m_Bursts)) {
@@ -2126,7 +2125,8 @@ function emissionEvents(
       const repeats = Math.max(1, Math.round(finite(burst.cycleCount, 1)));
       for (let repeat = 0; repeat < repeats; repeat += 1) {
         const time = baseTime + repeat * finite(burst.repeatInterval);
-        if (time > simulationDuration || random(seed + emissionIndex + 53) > finite(burst.probability, 1)) continue;
+        if (time > simulationDuration || random(seed + emissionIndex + 53) > finite(burst.probability, 1))
+          continue;
         const count = Math.max(
           0,
           Math.round(evaluateNativeMinMaxCurve(burst.countCurve, 0, random(seed + emissionIndex + 59))),
@@ -2136,7 +2136,9 @@ function emissionEvents(
     }
   }
   let accumulator = 0;
-  const maximumSimulationTime = system.looping ? simulationDuration : Math.min(simulationDuration, system.length);
+  const maximumSimulationTime = system.looping
+    ? simulationDuration
+    : Math.min(simulationDuration, system.length);
   for (let start = 0; start < maximumSimulationTime; start += EMISSION_STEP) {
     const step = Math.min(EMISSION_STEP, maximumSimulationTime - start);
     const sampleTime = start + step / 2;
@@ -2149,7 +2151,10 @@ function emissionEvents(
       accumulator -= 1;
     }
   }
-  const distanceRate = Math.max(0, evaluateNativeMinMaxCurve(emission.rateOverDistance, 0, random(seed + 67)));
+  const distanceRate = Math.max(
+    0,
+    evaluateNativeMinMaxCurve(emission.rateOverDistance, 0, random(seed + 67)),
+  );
   const distancePath = system.animationPathHash;
   const hasAnimatedRate =
     distancePath !== undefined &&
@@ -2161,7 +2166,8 @@ function emissionEvents(
     for (let realTime = EMISSION_STEP; realTime <= realDuration + Number.EPSILON; realTime += EMISSION_STEP) {
       const currentTime = Math.min(realDuration, realTime);
       movementAt(prefab, judgementAnimation, animationTimeOffset + currentTime, MOVEMENT_CURRENT_SCRATCH);
-      const currentSimulationTime = simulationClock?.timeAt(currentTime) ?? currentTime * system.simulationSpeed;
+      const currentSimulationTime =
+        simulationClock?.timeAt(currentTime) ?? currentTime * system.simulationSpeed;
       if (currentSimulationTime <= 0) {
         MOVEMENT_PREVIOUS_SCRATCH[0] = MOVEMENT_CURRENT_SCRATCH[0];
         MOVEMENT_PREVIOUS_SCRATCH[1] = MOVEMENT_CURRENT_SCRATCH[1];
@@ -2198,11 +2204,17 @@ function emissionEvents(
           MOVEMENT_CURRENT_SCRATCH[2] - MOVEMENT_PREVIOUS_SCRATCH[2],
         ) *
         rate *
-        particleSystemSimulationSpeedAt(system, prefab.manifest, judgementAnimation, animationTimeOffset + currentTime);
+        particleSystemSimulationSpeedAt(
+          system,
+          prefab.manifest,
+          judgementAnimation,
+          animationTimeOffset + currentTime,
+        );
       const previousRemainder = distanceAccumulator;
       distanceAccumulator += emittedDistanceCount;
       const previousTime = Math.max(0, currentTime - EMISSION_STEP);
-      const previousSimulationTime = simulationClock?.timeAt(previousTime) ?? previousTime * system.simulationSpeed;
+      const previousSimulationTime =
+        simulationClock?.timeAt(previousTime) ?? previousTime * system.simulationSpeed;
       let crossing = 1 - previousRemainder;
       while (distanceAccumulator >= 1) {
         // StartModules distributes births using emission spacing and the
@@ -2272,7 +2284,12 @@ function resetIncrementalEmissionState(state: IncrementalEmissionState, seed: nu
 }
 
 /** Append an already chronological rate-over-time emission to a bounded ring. */
-function appendRateEmission(ring: EmissionRing, capacity: number, simulationTime: number, index: number): void {
+function appendRateEmission(
+  ring: EmissionRing,
+  capacity: number,
+  simulationTime: number,
+  index: number,
+): void {
   if (capacity <= 0) return;
   let slot: number;
   if (ring.count < capacity) {
@@ -2294,6 +2311,8 @@ function appendRateEmission(ring: EmissionRing, capacity: number, simulationTime
   emission.originY = 0;
   emission.originZ = 0;
   emission.index = index;
+  emission.shapeBirthWidth = undefined;
+  emission.motion = undefined;
 }
 
 function emissionRingAt(ring: EmissionRing, index: number): ParticleEmission {
@@ -2365,7 +2384,8 @@ function incrementalRateEmissionEvents(
   age: number,
   seed: number,
 ): ParticleEmission[] {
-  if (!state.initialized || state.seed !== seed || age < state.lastAge) resetIncrementalEmissionState(state, seed);
+  if (!state.initialized || state.seed !== seed || age < state.lastAge)
+    resetIncrementalEmissionState(state, seed);
   clearEmissionRing(state.transient);
   const emission = record(system.raw.EmissionModule);
   const delay = evaluateNativeMinMaxCurve(system.raw.startDelay, 0, random(seed + 1));
@@ -2376,7 +2396,9 @@ function incrementalRateEmissionEvents(
     return state.output;
   }
   const simulationDuration = Math.max(0, elapsedAfterDelay) * system.simulationSpeed;
-  const maximumSimulationTime = system.looping ? simulationDuration : Math.min(simulationDuration, system.length);
+  const maximumSimulationTime = system.looping
+    ? simulationDuration
+    : Math.min(simulationDuration, system.length);
 
   // Commit complete native 60 Hz steps. The final fractional step is rebuilt
   // into a separate ring each frame because the full replay changes its sample
@@ -2538,11 +2560,15 @@ export class ParticleLayer {
   private readonly laneEffectBatch: EffectMeshBatch;
   private readonly impactBatchList: ReadonlyArray<EffectMeshBatch>;
   private readonly prefabManifests = new Map<number, Effect001PrefabAssetRef>();
-  private readonly prefabSpriteMaps = new Map<number, ReadonlyMap<Effect001SpriteName, Effect001SpriteAssetRef>>();
+  private readonly prefabSpriteMaps = new Map<
+    number,
+    ReadonlyMap<Effect001SpriteName, Effect001SpriteAssetRef>
+  >();
   private readonly loadedPrefabs = new Map<number, LoadedPrefab>();
   private readonly impacts = new Map<string, ImpactVisual>();
   private readonly impactPool: ImpactVisual[] = [];
   private readonly emissionStatePools = new Map<LoadedParticleSystem, IncrementalEmissionState[]>();
+  private readonly motionStatePools = new Map<LoadedParticleSystem, ParticleMotionSystem[]>();
   private readonly nextImpactIds = new Set<string>();
   private readonly effectIdScratch: string[] = [];
   private readonly noteEffectScratch: RenderParticleEffect[] = [];
@@ -2579,7 +2605,12 @@ export class ParticleLayer {
     this.capacity = this.maxEffects * this.particlesPerEffect;
     this.batches = {
       star: new ParticleQuadBatch("star", this.capacity, this.fallbackTexture, MOBILE_ADD_HDR_TINT_NORMAL),
-      longStar: new ParticleQuadBatch("longStar", this.capacity, this.fallbackTexture, MOBILE_ADD_HDR_TINT_LONG_STAR),
+      longStar: new ParticleQuadBatch(
+        "longStar",
+        this.capacity,
+        this.fallbackTexture,
+        MOBILE_ADD_HDR_TINT_LONG_STAR,
+      ),
       centerPillar: new ParticleQuadBatch(
         "centerPillar",
         this.capacity,
@@ -2745,27 +2776,30 @@ export class ParticleLayer {
     laneEffectSystemResults: PromiseSettledResult<readonly [LaneEffectAssetKey, LoadedParticleSystem]>[];
     prefabResults: LoadedPrefab[];
   }> {
-    const errorOf = (reason: unknown): Error => (reason instanceof Error ? reason : new Error(String(reason)));
+    const errorOf = (reason: unknown): Error =>
+      reason instanceof Error ? reason : new Error(String(reason));
     const laneEffectEntries = Object.entries(this.assets.particles.laneEffects) as Array<
       [LaneEffectAssetKey, LaneEffectParticleAssetRef]
     >;
     const laneEffectSystemResultsPromise = Promise.allSettled(
-      laneEffectEntries.map(async ([key, ref]): Promise<readonly [LaneEffectAssetKey, LoadedParticleSystem]> => {
-        const parsed = readNativeParticleSystem(await readJson(ref.particleSystemMetadataUrl));
-        if (!parsed) throw new Error(`${ref.particleSystemMetadataUrl}: invalid ParticleSystem projection`);
-        return [
-          key,
-          loadedParticleSystem(parsed, {
-            name: `lane-effect/${key}`,
-            metadataUrl: ref.particleSystemMetadataUrl,
-            texture: "star",
-            localPosition: [0, 0, 0],
-            // Lane effects render through EffectMeshBatch, not the
-            // effect001 billboard shader that consumes this field.
-            rendererMaxParticleSize: 0,
-          }),
-        ] as const;
-      }),
+      laneEffectEntries.map(
+        async ([key, ref]): Promise<readonly [LaneEffectAssetKey, LoadedParticleSystem]> => {
+          const parsed = readNativeParticleSystem(await readJson(ref.particleSystemMetadataUrl));
+          if (!parsed) throw new Error(`${ref.particleSystemMetadataUrl}: invalid ParticleSystem projection`);
+          return [
+            key,
+            loadedParticleSystem(parsed, {
+              name: `lane-effect/${key}`,
+              metadataUrl: ref.particleSystemMetadataUrl,
+              texture: "star",
+              localPosition: [0, 0, 0],
+              // Lane effects render through EffectMeshBatch, not the
+              // effect001 billboard shader that consumes this field.
+              rendererMaxParticleSize: 0,
+            }),
+          ] as const;
+        },
+      ),
     );
     const animationRequests = new Map<string, Promise<NativeAnimationClip | undefined>>();
     const loadAnimation = (url: string): Promise<NativeAnimationClip | undefined> => {
@@ -2793,7 +2827,7 @@ export class ParticleLayer {
         const [systemResults, animationResult, animationResults, distanceResult] = await Promise.all([
           Promise.allSettled(
             manifest.particleSystems.map(async (ref): Promise<LoadedParticleSystem | undefined> => {
-              const parsed = readNativeParticleSystem(await readJson(ref.metadataUrl));
+              const parsed = readNativeParticleSystem(await readJson(ref.metadataUrl), ref.originalIdentity);
               if (!parsed) throw new Error(`${ref.metadataUrl}: invalid ParticleSystem projection`);
               return loadedParticleSystem(parsed, ref);
             }),
@@ -2815,7 +2849,8 @@ export class ParticleLayer {
           return [];
         });
         const animations = new Map<Effect001AnimationJudgement, NativeAnimationClip>();
-        for (const [judgement, animation] of animationResults) if (animation) animations.set(judgement, animation);
+        for (const [judgement, animation] of animationResults)
+          if (animation) animations.set(judgement, animation);
         return {
           manifest,
           systems,
@@ -2916,8 +2951,13 @@ export class ParticleLayer {
           systemSeed,
           playback.age,
         );
-        const systemTime = simulationClock?.current ?? constantParticleSimulationTime(system, playback.age, systemSeed);
-        const parentWidthScaleX = nativeEffectWidthRangeScale(this.projector, width, system.ref.widthScaleRange);
+        const systemTime =
+          simulationClock?.current ?? constantParticleSimulationTime(system, playback.age, systemSeed);
+        const parentWidthScaleX = nativeEffectWidthRangeScale(
+          this.projector,
+          width,
+          system.ref.widthScaleRange,
+        );
         const emissions = this.emissionEventsFor(
           impact,
           system,
@@ -2928,6 +2968,24 @@ export class ParticleLayer {
           playback.animationTimeOffset,
           simulationClock,
           parentWidthScaleX,
+        );
+        captureEmissionShapeWidths(
+          impact.shapeBirthWidths,
+          system,
+          emissions,
+          playback.age,
+          systemSeed,
+          width,
+        );
+        this.advanceImpactMotions(
+          impact,
+          system,
+          emissions,
+          playback.age,
+          systemSeed,
+          width,
+          systemTime,
+          playback.animationTimeOffset,
         );
         for (const emission of emissions) {
           const sample = sampleParticle(
@@ -2951,7 +3009,14 @@ export class ParticleLayer {
             system.scalingMode,
             parentWidthScaleX,
           );
-          nativeParticleLocalPosition(system.ref, sampleX, sample.y, sample.z, hierarchyScaleX, this.localPointScratch);
+          nativeParticleLocalPosition(
+            system.ref,
+            sampleX,
+            sample.y,
+            sample.z,
+            hierarchyScaleX,
+            this.localPointScratch,
+          );
           const worldX = this.pointScratch.x + this.localPointScratch.x * mirror;
           const worldY = this.pointScratch.y + this.localPointScratch.y;
           const worldZ = this.pointScratch.z + this.localPointScratch.z;
@@ -2979,6 +3044,13 @@ export class ParticleLayer {
             emission: emission.index,
             particleSeed: systemSeed ^ Math.imul(emission.index + 1, 0x9e3779b9),
             simulationSpeed: system.simulationSpeed,
+            clock: {
+              realTimeOffset: effect.age - playback.age,
+              currentSimulationTime: systemTime,
+              emissionSimulationTime: emission.motion?.birthTime ?? emission.simulationTime,
+              simulationTimeAt:
+                simulationClock?.timeAt ?? ((age) => constantParticleSimulationTime(system, age, systemSeed)),
+            },
             materialTint: system.ref.materialTint,
             age: sample.age,
             lifetime: sample.lifetime,
@@ -3105,7 +3177,11 @@ export class ParticleLayer {
       const sizeValue = clipBindingValue(animation, path, ATTRIBUTE_SIZE_X, animationTime);
       const active = activeValue === undefined ? spec.baseActive : activeValue >= 0.5;
       const alpha = alphaValue === undefined ? spec.baseColor[3] : clamp(alphaValue);
-      if (!active || alpha <= 0 || (!this.traceSink && !this.textures.has(name === "frame" ? "line" : "pillar")))
+      if (
+        !active ||
+        alpha <= 0 ||
+        (!this.traceSink && !this.textures.has(name === "frame" ? "line" : "pillar"))
+      )
         continue;
       const x =
         name === "pillar01" || name === "pillar03"
@@ -3126,9 +3202,12 @@ export class ParticleLayer {
       const spriteZ = position.z - spec.localPosition[2] + rotatedPivotZ;
       const scaleX = sizeX * spec.localScale[0] * manifest.rootScaleX * flipX;
       const scaleY = spec.baseSize[1] * spec.localScale[1];
-      const red = clipBindingValue(animation, path, SPRITE_COLOR_ATTRIBUTES[0]!, animationTime) ?? spec.baseColor[0];
-      const green = clipBindingValue(animation, path, SPRITE_COLOR_ATTRIBUTES[1]!, animationTime) ?? spec.baseColor[1];
-      const blue = clipBindingValue(animation, path, SPRITE_COLOR_ATTRIBUTES[2]!, animationTime) ?? spec.baseColor[2];
+      const red =
+        clipBindingValue(animation, path, SPRITE_COLOR_ATTRIBUTES[0]!, animationTime) ?? spec.baseColor[0];
+      const green =
+        clipBindingValue(animation, path, SPRITE_COLOR_ATTRIBUTES[1]!, animationTime) ?? spec.baseColor[1];
+      const blue =
+        clipBindingValue(animation, path, SPRITE_COLOR_ATTRIBUTES[2]!, animationTime) ?? spec.baseColor[2];
       batch.push(
         spriteX,
         spriteY,
@@ -3181,7 +3260,18 @@ export class ParticleLayer {
       playback.animationTimeOffset,
       simulationClock,
     );
-    const wallTime = simulationClock?.current ?? constantParticleSimulationTime(wallSystem, playback.age, wallSeed);
+    const wallTime =
+      simulationClock?.current ?? constantParticleSimulationTime(wallSystem, playback.age, wallSeed);
+    this.advanceImpactMotions(
+      impact,
+      wallSystem,
+      emissions,
+      playback.age,
+      wallSeed,
+      width,
+      wallTime,
+      playback.animationTimeOffset,
+    );
     for (const emission of emissions) {
       const sample = sampleParticle(
         wallSystem,
@@ -3232,6 +3322,119 @@ export class ParticleLayer {
     return impact;
   }
 
+  private advanceImpactMotions(
+    impact: ImpactVisual,
+    system: LoadedParticleSystem,
+    emissions: ReadonlyArray<ParticleEmission>,
+    age: number,
+    seed: number,
+    width: number,
+    simulationTime: number,
+    animationTimeOffset: number,
+  ): void {
+    if (record(system.raw.ClampVelocityModule)?.enabled !== true) return;
+    let state = impact.motionStates.get(system);
+    if (!state) {
+      state = this.motionStatePools.get(system)?.pop() ?? {
+        initialized: false,
+        seed,
+        lastAge: 0,
+        animationTimeOffset: 0,
+        epoch: 0,
+        clock: new NativeParticleMotionClock(
+          system.motionSource.maximumLifetime,
+          OUR_NOTES_MAXIMUM_PARTICLE_TIMESTEP,
+        ),
+        particles: new Map(),
+        pool: [],
+      };
+      impact.motionStates.set(system, state);
+    }
+    if (
+      !state.initialized ||
+      state.seed !== seed ||
+      age < state.lastAge ||
+      state.animationTimeOffset !== animationTimeOffset
+    ) {
+      state.clock.reset();
+      for (const particle of state.particles.values()) state.pool.push(particle);
+      state.particles.clear();
+      state.seed = seed;
+      state.animationTimeOffset = animationTimeOffset;
+      state.initialized = true;
+    }
+    state.lastAge = age;
+    state.clock.beginFrame(simulationTime);
+    const epoch = ++state.epoch;
+    for (const [index, motion] of state.particles)
+      if (simulationTime - motion.birthTime >= motion.lifetime) {
+        state.particles.delete(index);
+        state.pool.push(motion);
+      }
+    const initial = record(system.raw.InitialModule)!;
+    for (const emission of emissions) {
+      emission.motion = undefined;
+      let motion = state.particles.get(emission.index);
+      if (!motion) {
+        const particleSeed = seed ^ Math.imul(emission.index + 1, 0x9e3779b9);
+        const lifetime = Math.max(
+          0,
+          evaluateNativeMinMaxCurve(initial.startLifetime, 0, random(particleSeed + 11)),
+        );
+        const age = simulationTime - emission.simulationTime;
+        if (lifetime <= 0 || age < 0 || age >= lifetime) continue;
+        shapePosition(
+          system,
+          particleSeed,
+          emission.shapeBirthWidth ?? width,
+          SHAPE_POSITION_SCRATCH,
+          SHAPE_INITIAL_VELOCITY_SCRATCH,
+        );
+        const shape = record(system.raw.ShapeModule);
+        const speed =
+          shape?.enabled === true && shape.type === 10
+            ? evaluateNativeMinMaxCurve(initial.startSpeed, 0, random(particleSeed + 43))
+            : 0;
+        motion = state.pool.pop() ?? {
+          birthTime: 0,
+          simulationTime: 0,
+          age: 0,
+          lifetime: 0,
+          curveRandom: 0,
+          x: 0,
+          y: 0,
+          z: 0,
+          velocityX: 0,
+          velocityY: 0,
+          velocityZ: 0,
+          lastSeen: 0,
+        };
+        motion.birthTime = emission.simulationTime;
+        motion.simulationTime = emission.simulationTime;
+        motion.age = 0;
+        motion.lifetime = lifetime;
+        motion.curveRandom = random(particleSeed + 23);
+        motion.x = SHAPE_POSITION_SCRATCH[0];
+        motion.y = SHAPE_POSITION_SCRATCH[1];
+        motion.z = SHAPE_POSITION_SCRATCH[2];
+        motion.velocityX = SHAPE_INITIAL_VELOCITY_SCRATCH[0] * speed;
+        motion.velocityY = SHAPE_INITIAL_VELOCITY_SCRATCH[1] * speed;
+        motion.velocityZ = SHAPE_INITIAL_VELOCITY_SCRATCH[2] * speed;
+        state.particles.set(emission.index, motion);
+      }
+      if (simulationTime - motion.birthTime >= motion.lifetime) continue;
+      motion.lastSeen = epoch;
+      state.clock.advance(system.motionSource, motion);
+      emission.motion = motion;
+    }
+    for (const [index, motion] of state.particles)
+      if (motion.lastSeen !== epoch) {
+        state.particles.delete(index);
+        state.pool.push(motion);
+      }
+    state.clock.endFrame();
+  }
+
   private emissionEventsFor(
     impact: ImpactVisual,
     system: LoadedParticleSystem,
@@ -3270,6 +3473,20 @@ export class ParticleLayer {
   }
 
   private releaseImpactEmissionStates(impact: ImpactVisual): void {
+    impact.shapeBirthWidths.clear();
+    for (const [system, state] of impact.motionStates) {
+      state.initialized = false;
+      state.clock.reset();
+      for (const particle of state.particles.values()) state.pool.push(particle);
+      state.particles.clear();
+      let pool = this.motionStatePools.get(system);
+      if (!pool) {
+        pool = [];
+        this.motionStatePools.set(system, pool);
+      }
+      if (pool.length < this.maxEffects) pool.push(state);
+    }
+    impact.motionStates.clear();
     for (const [system, state] of impact.emissionStates) {
       state.initialized = false;
       clearEmissionRing(state.persistent);
@@ -3295,7 +3512,14 @@ export class ParticleLayer {
     const root = new Group();
     root.name = `Effect001:${id}`;
     this.impactAllocations += 1;
-    return { root, lastSeen: 0, prefabId: -1, emissionStates: new Map() };
+    return {
+      root,
+      lastSeen: 0,
+      prefabId: -1,
+      emissionStates: new Map(),
+      shapeBirthWidths: new Map(),
+      motionStates: new Map(),
+    };
   }
 
   private removeImpact(id: string, impact: ImpactVisual): void {
@@ -3361,6 +3585,7 @@ export class ParticleLayer {
     this.impacts.clear();
     this.impactPool.length = 0;
     this.emissionStatePools.clear();
+    this.motionStatePools.clear();
     for (const batch of this.batchList) batch.dispose();
     for (const batch of this.impactBatchList) batch.dispose();
     this.laneEffectBatch.dispose();

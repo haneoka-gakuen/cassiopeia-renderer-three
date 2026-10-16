@@ -14,4 +14,17 @@ export * from "./render/noteSkinLayout";
 export * from "./render/pixelRatio";
 export * from "./render/stageGeometry";
 export * from "./render/presentation";
+export * from "./render/NativeIntroMesh";
+export * from "./render/NativeIntroTimeline";
+export * from "./render/NativeIntroScene";
+export * from "./render/NativeIntroLoader";
+export * from "./render/NativeIntroSourceIndex";
+export * from "./render/NativeIntroSignals";
+export * from "./render/NativeIntroSpriteLayer";
+export * from "./render/NativeParticleNoise";
+export * from "./render/NativeParticleNoiseOwner";
 export * from "./plugin";
+
+export * from "./render/NativeIntroParticles";
+export * from "./render/NativeIntroParticleLayer";
+export * from "./render/NativeIntroAssembler";

@@ -4,6 +4,7 @@ import {
   Color,
   DoubleSide,
   Group,
+  LinearFilter,
   Mesh,
   MeshBasicMaterial,
   OrthographicCamera,
@@ -227,12 +228,24 @@ function configureTexture(texture: Texture): Texture {
   return texture;
 }
 
+function configureLineTexture(texture: Texture): Texture {
+  configureTexture(texture);
+  texture.anisotropy = 1;
+  texture.generateMipmaps = false;
+  texture.minFilter = LinearFilter;
+  texture.magFilter = LinearFilter;
+  return texture;
+}
+
 /**
  * lane_base is already a tight alpha perspective sprite rendered by the
  * ScreenSpace-Camera canvas. It must not pass through LiveGameCamera again.
  */
 export class ScreenLaneBackdrop {
+  /** Layer-25 lane plane; composed through the in-game target. */
   readonly scene = new Scene();
+  /** Main-camera background, kept outside the in-game alpha path. */
+  readonly backgroundScene = new Scene();
   readonly camera = new OrthographicCamera(0, 1920, 1080, 0, -10, 10);
 
   private readonly backgroundBaseMaterial: MeshBasicMaterial;
@@ -246,6 +259,8 @@ export class ScreenLaneBackdrop {
   private texture?: Texture;
   private backgroundTexture?: Texture;
   private requestedOpacity = 1;
+  private introBackgroundScaleX = 1;
+  private introBackgroundScaleY = 1;
   private logicalWidth = 1920;
   private logicalHeight = 1080;
   private disposed = false;
@@ -310,7 +325,8 @@ export class ScreenLaneBackdrop {
     this.mesh = new Mesh(new PlaneGeometry(2048, 1644), this.material);
     this.mesh.name = "LaneBaseScreenSpace";
     this.mesh.renderOrder = 4000;
-    this.scene.add(this.backgroundBaseMesh, this.backgroundMesh, this.backgroundShadowMesh, this.mesh);
+    this.backgroundScene.add(this.backgroundBaseMesh, this.backgroundMesh, this.backgroundShadowMesh);
+    this.scene.add(this.mesh);
     this.camera.position.z = 1;
     this.resize(1920, 1080);
   }
@@ -346,7 +362,11 @@ export class ScreenLaneBackdrop {
     this.backgroundBaseMesh.position.set(logicalWidth / 2, logicalHeight / 2, -3);
     this.backgroundBaseMesh.scale.set(logicalWidth, logicalHeight, 1);
     this.backgroundMesh.position.set(logicalWidth / 2, logicalHeight / 2, -2);
-    this.backgroundMesh.scale.set(logicalWidth, logicalHeight, 1);
+    this.backgroundMesh.scale.set(
+      logicalWidth * this.introBackgroundScaleX,
+      logicalHeight * this.introBackgroundScaleY,
+      1,
+    );
     this.backgroundShadowMesh.position.set(logicalWidth / 2, logicalHeight / 2, -1);
     this.backgroundShadowMesh.scale.set(logicalWidth, logicalHeight, 1);
     this.updateBackgroundCover();
@@ -358,6 +378,13 @@ export class ScreenLaneBackdrop {
     if (this.material.opacity !== nextOpacity) this.material.opacity = nextOpacity;
     const visible = nextOpacity > 0;
     if (this.mesh.visible !== visible) this.mesh.visible = visible;
+  }
+
+  setBackgroundScale(x: number, y: number): void {
+    if (![x, y].every(Number.isFinite) || x < 0 || y < 0) throw new Error("Invalid intro background scale");
+    this.introBackgroundScaleX = x;
+    this.introBackgroundScaleY = y;
+    this.backgroundMesh.scale.set(this.logicalWidth * x, this.logicalHeight * y, 1);
   }
 
   setBackgroundTexture(texture?: Texture): void {
@@ -407,6 +434,7 @@ export class ScreenLaneBackdrop {
     this.mesh.geometry.dispose();
     this.material.dispose();
     this.scene.clear();
+    this.backgroundScene.clear();
   }
 }
 
@@ -429,10 +457,9 @@ const LANE_LINE_STYLES: Readonly<Record<0 | 1 | 2, LaneLineStyle>> = {
     farAlpha: 0,
   },
   1: {
-    // LiveLaneLineView reads the 16 px outside texture width and divides by
-    // 100 before assigning both LineRenderer widths.
-    nearWidth: 0.16,
-    farWidth: 0.16,
+    // LiveLaneLineView reads the 15 px outside texture height / 100.
+    nearWidth: 0.15,
+    farWidth: 0.15,
     nearColor: [1, 1, 1],
     farColor: [1, 1, 1],
     nearAlpha: 1,
@@ -452,7 +479,7 @@ const LANE_LINE_VERTEX_SHADER = `
   varying float vProgress;
   varying vec2 vUv;
   void main() {
-    vProgress = uv.y;
+    vProgress = uv.x;
     vUv = uv;
     gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
   }
@@ -464,7 +491,6 @@ const LANE_LINE_FRAGMENT_SHADER = `
   uniform vec3 uFarColor;
   uniform float uNearAlpha;
   uniform float uFarAlpha;
-  uniform float uGlobalOpacity;
   varying float vProgress;
   varying vec2 vUv;
   void main() {
@@ -472,7 +498,7 @@ const LANE_LINE_FRAGMENT_SHADER = `
     if (uUseMap > 0.5) texel = texture2D(uMap, vUv);
     gl_FragColor = vec4(
       mix(uNearColor, uFarColor, vProgress) * texel.rgb,
-      mix(uNearAlpha, uFarAlpha, vProgress) * uGlobalOpacity * texel.a
+      mix(uNearAlpha, uFarAlpha, vProgress) * texel.a
     );
   }
 `;
@@ -487,7 +513,6 @@ function createLaneLineMaterial(style: LaneLineStyle): ShaderMaterial {
       uFarColor: { value: new Color(...style.farColor) },
       uNearAlpha: { value: style.nearAlpha },
       uFarAlpha: { value: style.farAlpha },
-      uGlobalOpacity: { value: 1 },
     },
     vertexShader: LANE_LINE_VERTEX_SHADER,
     fragmentShader: LANE_LINE_FRAGMENT_SHADER,
@@ -513,21 +538,28 @@ interface LaneLineSpec {
 function appendLineGeometry(spec: LaneLineSpec, positions: number[], uvs: number[], indices: number[]): void {
   const { x, style, startZ, endZ } = spec;
   const base = positions.length / 3;
+  // LineRenderer alignment=View: cross the longitudinal tangent with the
+  // camera vector. Reflecting Unity Z leaves its side vector in XY.
+  const cameraY = OUR_NOTES_LIVE_GEOMETRY.cameraPosition[1];
+  const length = Math.hypot(cameraY, x);
+  const sideX = cameraY / length;
+  const sideY = x / length;
   positions.push(
-    x - style.nearWidth / 2,
-    0,
+    x - (sideX * style.nearWidth) / 2,
+    (-sideY * style.nearWidth) / 2,
     startZ,
-    x + style.nearWidth / 2,
-    0,
+    x + (sideX * style.nearWidth) / 2,
+    (sideY * style.nearWidth) / 2,
     startZ,
-    x - style.farWidth / 2,
-    0,
+    x - (sideX * style.farWidth) / 2,
+    (-sideY * style.farWidth) / 2,
     endZ,
-    x + style.farWidth / 2,
-    0,
+    x + (sideX * style.farWidth) / 2,
+    (sideY * style.farWidth) / 2,
     endZ,
   );
-  uvs.push(0, 0, 1, 0, 0, 1, 1, 1);
+  // LineRenderer Stretch maps U along the segment and V across its width.
+  uvs.push(0, 0, 0, 1, 1, 0, 1, 1);
   indices.push(base, base + 1, base + 2, base + 2, base + 1, base + 3);
 }
 
@@ -571,7 +603,9 @@ export class OurNotesStage {
   private guidelineCount = -1;
   private tapAreaTexture?: Texture;
   private outsideLineTexture?: Texture;
+  private lineTexture?: Texture;
   private laneOpacity = Number.NaN;
+  private tapAnimationAlpha = 1;
   private guidelineOpacity = Number.NaN;
   private judgementOpacity = Number.NaN;
   private disposed = false;
@@ -641,7 +675,7 @@ export class OurNotesStage {
     });
     this.judgementMaterial.forceSinglePass = true;
     // The two anchored outside lines merge into one geometry. Their centers
-    // are shifted outward by half the serialized .17 start width.
+    // are shifted outward by half the runtime texture-derived start width.
     const outsideEndZ = unityWorldZToThree(OUR_NOTES_LIVE_GEOMETRY.laneLength);
     const outsideSpecs: LaneLineSpec[] = [-1, 1].map((side) => ({
       x: side * (projector.stageWidth / 2 + LANE_LINE_STYLES[1].nearWidth / 2),
@@ -685,34 +719,57 @@ export class OurNotesStage {
   }
 
   async loadTextures(assets: OurNotesAssetManifest, loader = new TextureLoader()): Promise<void> {
-    const [tapAreaResult, outsideLineResult] = await Promise.allSettled([
+    const [tapAreaResult, outsideLineResult, lineResult] = await Promise.allSettled([
       loader.loadAsync(assets.lane.tapAreaTextureUrl),
       loader.loadAsync(assets.lane.outsideLineTextureUrl),
+      loader.loadAsync(assets.lane.lineTextureUrl),
     ]);
     if (this.disposed) {
       if (tapAreaResult.status === "fulfilled") tapAreaResult.value.dispose();
       if (outsideLineResult.status === "fulfilled") outsideLineResult.value.dispose();
+      if (lineResult.status === "fulfilled") lineResult.value.dispose();
       return;
     }
     if (tapAreaResult.status === "fulfilled") {
       this.tapAreaTexture?.dispose();
       this.tapAreaTexture = configureTexture(tapAreaResult.value);
       this.tapAreaMaterial.uniforms.uMap.value = this.tapAreaTexture;
-      this.tapAreaMaterial.uniforms.uOpacity.value = Number.isFinite(this.laneOpacity) ? this.laneOpacity : 1;
+      this.tapAreaMaterial.uniforms.uOpacity.value =
+        (Number.isFinite(this.laneOpacity) ? this.laneOpacity : 1) * this.tapAnimationAlpha;
       this.tapAreaMesh.visible = this.tapAreaMaterial.uniforms.uOpacity.value > 0;
       this.tapAreaMaterial.needsUpdate = true;
     }
     if (outsideLineResult.status === "fulfilled") {
       this.outsideLineTexture?.dispose();
-      this.outsideLineTexture = configureTexture(outsideLineResult.value);
+      this.outsideLineTexture = configureLineTexture(outsideLineResult.value);
       this.outsideLinesMaterial.uniforms.uMap.value = this.outsideLineTexture;
       this.outsideLinesMaterial.uniforms.uUseMap.value = 1;
       this.outsideLinesMaterial.needsUpdate = true;
     }
+    if (lineResult.status === "fulfilled") {
+      this.lineTexture?.dispose();
+      this.lineTexture = configureLineTexture(lineResult.value);
+      for (const material of [this.mainLinesMaterial, this.spaceLinesMaterial]) {
+        material.uniforms.uMap.value = this.lineTexture;
+        material.uniforms.uUseMap.value = 1;
+        material.needsUpdate = true;
+      }
+    }
     const errors: unknown[] = [];
     if (tapAreaResult.status === "rejected") errors.push(tapAreaResult.reason);
     if (outsideLineResult.status === "rejected") errors.push(outsideLineResult.reason);
+    if (lineResult.status === "rejected") errors.push(lineResult.reason);
     if (errors.length > 0) throw new AggregateError(errors, "One or more native lane textures failed to load");
+  }
+
+  setTapAnimationAlpha(alpha: number): void {
+    if (!Number.isFinite(alpha)) throw new Error("Invalid tap-area animation alpha");
+    this.tapAnimationAlpha = clamp(alpha, 0, 1);
+    this.tapAreaMaterial.uniforms.uOpacity.value =
+      (this.tapAreaTexture ? 1 : 0) *
+      (Number.isFinite(this.laneOpacity) ? this.laneOpacity : 1) *
+      this.tapAnimationAlpha;
+    this.tapAreaMesh.visible = this.tapAreaMaterial.uniforms.uOpacity.value > 0;
   }
 
   update(state: RenderStageState | undefined): void {
@@ -723,15 +780,17 @@ export class OurNotesStage {
     if (state?.guidelineCount !== undefined) this.setGuidelineCount(state.guidelineCount);
     if (laneOpacity !== this.laneOpacity) {
       this.laneOpacity = laneOpacity;
-      this.tapAreaMaterial.uniforms.uOpacity.value = (this.tapAreaTexture ? 1 : 0) * laneOpacity;
+      this.tapAreaMaterial.uniforms.uOpacity.value =
+        (this.tapAreaTexture ? 1 : 0) * laneOpacity * this.tapAnimationAlpha;
       this.tapAreaMesh.visible = this.tapAreaMaterial.uniforms.uOpacity.value > 0;
     }
     if (guidelineOpacity !== this.guidelineOpacity) {
       this.guidelineOpacity = guidelineOpacity;
-      for (const material of this.lineMaterials) material.uniforms.uGlobalOpacity.value = guidelineOpacity;
-      const visible = guidelineOpacity > 0;
-      this.guidelineGroup.visible = visible;
-      this.outsideGroup.visible = visible;
+      for (const material of [this.mainLinesMaterial, this.spaceLinesMaterial]) {
+        material.uniforms.uNearAlpha.value = guidelineOpacity;
+        material.uniforms.uFarAlpha.value = guidelineOpacity;
+      }
+      this.guidelineGroup.visible = guidelineOpacity > 0;
     }
     if (judgementOpacity !== this.judgementOpacity) {
       this.judgementOpacity = judgementOpacity;
@@ -769,7 +828,11 @@ export class OurNotesStage {
           endZ: this.projector.judgementZ - OUR_NOTES_LIVE_GEOMETRY.laneSpaceLineLength / 2,
         });
       } else {
-        mainSpecs.push({ x, style: LANE_LINE_STYLES[0], startZ: 0, endZ: fullEndZ });
+        const style =
+          index === laneCount / 2
+            ? { ...LANE_LINE_STYLES[0], farWidth: LANE_LINE_STYLES[0].farWidth * 2 }
+            : LANE_LINE_STYLES[0];
+        mainSpecs.push({ x, style, startZ: 0, endZ: fullEndZ });
       }
     }
     this.mainLinesMesh = this.applyGuidelineMesh(
@@ -811,6 +874,7 @@ export class OurNotesStage {
     this.disposed = true;
     this.tapAreaTexture?.dispose();
     this.outsideLineTexture?.dispose();
+    this.lineTexture?.dispose();
     this.group?.traverse((object) => {
       if (object instanceof Mesh) object.geometry.dispose();
     });
