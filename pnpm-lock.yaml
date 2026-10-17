@@ -8,6 +8,9 @@ importers:
 
   .:
     dependencies:
+      '@haneoka/render-shaders':
+        specifier: git+https://github.com/haneoka-gakuen/render-shaders.git#6bf76578c7ebdf318f5a3f5c198d01ac9235c853
+        version: https://codeload.github.com/haneoka-gakuen/render-shaders/tar.gz/6bf76578c7ebdf318f5a3f5c198d01ac9235c853(three@0.184.0)
       fast-png:
         specifier: ^8.0.0
         version: 8.0.0
@@ -191,6 +194,15 @@ packages:
     engines: {node: '>=18'}
     cpu: [x64]
     os: [win32]
+
+  '@haneoka/render-shaders@https://codeload.github.com/haneoka-gakuen/render-shaders/tar.gz/6bf76578c7ebdf318f5a3f5c198d01ac9235c853':
+    resolution: {gitHosted: true, tarball: https://codeload.github.com/haneoka-gakuen/render-shaders/tar.gz/6bf76578c7ebdf318f5a3f5c198d01ac9235c853}
+    version: 0.1.0
+    peerDependencies:
+      three: '>=0.184.0 <0.185.0'
+    peerDependenciesMeta:
+      three:
+        optional: true
 
   '@napi-rs/lzma-linux-x64-gnu@1.5.1':
     resolution: {integrity: sha512-oTXEIha4SsuXdTA4Iyskj0kpdx2yVXdhd75c2v3xGrHFfVMsbhTPZU/nMPL4sWKo4pBHm3aucLaqGlF696dTyQ==}
@@ -552,6 +564,10 @@ snapshots:
 
   '@esbuild/win32-x64@0.28.2':
     optional: true
+
+  '@haneoka/render-shaders@https://codeload.github.com/haneoka-gakuen/render-shaders/tar.gz/6bf76578c7ebdf318f5a3f5c198d01ac9235c853(three@0.184.0)':
+    optionalDependencies:
+      three: 0.184.0
 
   '@napi-rs/lzma-linux-x64-gnu@1.5.1':
     optional: true

@@ -1,3 +1,5 @@
+import { SpatialUpscalerPass } from "@haneoka/render-shaders/three";
+import type { SpatialConfiguration } from "@haneoka/render-shaders/three";
 import {
   AdditiveBlending,
   Color,
@@ -442,6 +444,20 @@ function createColorTarget(name: string, hdr: boolean, depth = false): WebGLRend
 
 /** Retained targets for the native game-alpha and main additive compositions. */
 export class LiveGameCompositor {
+  private spatial: SpatialUpscalerPass | null = null;
+  private nativeWidth = 1;
+  private nativeHeight = 1;
+  setSpatialUpscaling(value: SpatialConfiguration, width: number, height: number): void {
+    this.nativeWidth = width;
+    this.nativeHeight = height;
+    if (value.factor > 1) {
+      this.spatial ??= new SpatialUpscalerPass();
+      this.spatial.setConfiguration(value);
+    } else {
+      this.spatial?.dispose();
+      this.spatial = null;
+    }
+  }
   private readonly gameTarget = createColorTarget("our-notes-live-game-rgba8", false, true);
   private readonly mainTarget = createColorTarget("our-notes-live-main-rgba16f", true);
   private readonly scene = new Scene();
@@ -514,9 +530,14 @@ export class LiveGameCompositor {
       this.mesh.material = this.gameMaterial;
       renderer.render(this.scene, this.camera);
       drawEffects(this.mainTarget);
-      renderer.setRenderTarget(null);
-      this.mesh.material = this.outputMaterial;
-      renderer.render(this.scene, this.camera);
+      if (this.spatial) {
+        // Main composition contains final gamma RGB, including resolved bloom.
+        this.spatial.render(renderer, this.mainTarget, this.nativeWidth, this.nativeHeight);
+      } else {
+        renderer.setRenderTarget(null);
+        this.mesh.material = this.outputMaterial;
+        renderer.render(this.scene, this.camera);
+      }
     } finally {
       renderer.setRenderTarget(null);
       renderer.setClearColor(this.clearColor, previousAlpha);
@@ -524,6 +545,7 @@ export class LiveGameCompositor {
   }
 
   dispose(): void {
+    this.spatial?.dispose();
     this.gameTarget.dispose();
     this.mainTarget.dispose();
     this.gameMaterial.dispose();

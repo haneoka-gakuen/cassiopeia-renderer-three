@@ -62,6 +62,7 @@
     "url": "https://github.com/haneoka-gakuen/cassiopeia-renderer-three/issues"
   },
   "dependencies": {
-    "fast-png": "^8.0.0"
+    "fast-png": "^8.0.0",
+    "@haneoka/render-shaders": "git+https://github.com/haneoka-gakuen/render-shaders.git#6bf76578c7ebdf318f5a3f5c198d01ac9235c853"
   }
 }

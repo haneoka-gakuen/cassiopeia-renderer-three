@@ -1,3 +1,5 @@
+import { spatialConfiguration, spatialInputSize } from "@haneoka/render-shaders/three";
+import type { SpatialConfiguration } from "@haneoka/render-shaders/three";
 import type { NativeIntroAssembly } from "./NativeIntroAssembler";
 import {
   CanvasTexture,
@@ -119,6 +121,14 @@ export class OurNotesRenderer implements NativeChartPresentation {
   private readonly effectScene = new Scene();
   private readonly liveBloom: LiveUrpBloomPipeline;
   private readonly gameCompositor = new LiveGameCompositor();
+  private spatialConfiguration = spatialConfiguration();
+  private lastRenderFrame?: RenderFrame;
+  setSpatialUpscaling(value: SpatialConfiguration): void {
+    this.spatialConfiguration = spatialConfiguration(value);
+    this.sized = false;
+    this.resize(this.width, this.height, this.pixelRatio);
+    if (this.lastRenderFrame) this.render(this.lastRenderFrame);
+  }
   private readonly gammaMaterials = new WeakSet<MeshBasicMaterial>();
   private readonly gammaTextures = new WeakSet<Texture>();
   private readonly onNoteVisualAdded = (event: { child: Object3D }): void => {
@@ -425,6 +435,7 @@ export class OurNotesRenderer implements NativeChartPresentation {
 
   render(frame: RenderFrame): void {
     if (this.disposed || this.contextLost) return;
+    this.lastRenderFrame = frame;
     this.refreshBackgroundCanvas();
     this.renderer.info.reset();
     this.stage.update(frame.stage);
@@ -530,8 +541,18 @@ export class OurNotesRenderer implements NativeChartPresentation {
     this.updateLaneProjection();
     this.screenLane?.resize(this.width, this.height);
     this.renderer.getDrawingBufferSize(this.drawingBufferSize);
-    this.liveBloom.setSize(this.drawingBufferSize.x, this.drawingBufferSize.y);
-    this.gameCompositor.setSize(this.drawingBufferSize.x, this.drawingBufferSize.y);
+    const world = spatialInputSize(
+      this.drawingBufferSize.x,
+      this.drawingBufferSize.y,
+      this.spatialConfiguration.factor,
+    );
+    this.liveBloom.setSize(world.width, world.height);
+    this.gameCompositor.setSize(world.width, world.height);
+    this.gameCompositor.setSpatialUpscaling(
+      this.spatialConfiguration,
+      this.drawingBufferSize.x,
+      this.drawingBufferSize.y,
+    );
     this.effectCacheActive = false;
     this.lastEffectFrame = -1;
     this.particles.setPixelRatio(this.pixelRatio);
