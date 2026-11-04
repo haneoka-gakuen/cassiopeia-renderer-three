@@ -3,8 +3,10 @@ import {
   BufferGeometry,
   DoubleSide,
   DynamicDrawUsage,
+  StreamDrawUsage,
   Group,
   Matrix3,
+  Matrix4,
   Mesh,
   MeshBasicMaterial,
   NormalBlending,
@@ -14,7 +16,7 @@ import {
   PlaneGeometry,
   ShaderMaterial,
 } from "three";
-import type { Raycaster } from "three";
+import type { Raycaster, Texture } from "three";
 import type { NativeNoteHit } from "./presentation";
 import { SpriteAtlas, type SpriteMesh, type SpriteRegion } from "../assets/SpriteAtlas";
 import { OUR_NOTES_LIVE_GEOMETRY, type OurNotesAssetManifest } from "@haneoka/cassiopeia-plugin-our-notes";
@@ -80,6 +82,176 @@ interface NoteDescriptor {
   arrowName?: string;
 }
 
+/** Retain native triangles and ordering while sharing one atlas draw per sorting layer. */
+class NoteAtlasBatch {
+  readonly mesh: Mesh<BufferGeometry, MeshBasicMaterial>;
+  private readonly transform = new Matrix4();
+  private readonly sources: Mesh<BufferGeometry, MeshBasicMaterial>[] = [];
+  private readonly sourceCache: {
+    mesh?: Mesh<BufferGeometry, MeshBasicMaterial>;
+    geometry?: BufferGeometry;
+    map?: Texture;
+    uvVersion?: number;
+    indexVersion?: number;
+    vertexOffset?: number;
+    indexOffset?: number;
+    r?: number;
+    g?: number;
+    b?: number;
+    alpha?: number;
+  }[] = [];
+  private vertices = 0;
+  private indices = 0;
+  private vertexCapacity = 0;
+  private indexCapacity = 0;
+
+  constructor(material: MeshBasicMaterial, order: number) {
+    material.vertexColors = true;
+    this.mesh = new Mesh(new BufferGeometry(), material);
+    for (const [name, size] of [
+      ["position", 3],
+      ["uv", 2],
+      ["color", 4],
+    ] as const) {
+      this.mesh.geometry.setAttribute(name, new BufferAttribute(new Float32Array(3 * size), size));
+    }
+    this.mesh.geometry.setIndex(new BufferAttribute(new Uint32Array([0, 1, 2]), 1));
+    this.mesh.geometry.setDrawRange(0, 0);
+    this.mesh.name = "OurNotesNoteAtlasBatch";
+    this.mesh.frustumCulled = false;
+    this.mesh.renderOrder = order;
+  }
+
+  begin(): void {
+    this.sources.length = 0;
+    this.vertices = this.indices = 0;
+  }
+
+  add(mesh: Mesh<BufferGeometry, MeshBasicMaterial>): void {
+    if (!mesh.visible || !mesh.material.colorWrite || mesh.material.opacity <= 0.001) return;
+    this.sources.push(mesh);
+    this.vertices += mesh.geometry.getAttribute("position").count;
+    this.indices += mesh.geometry.index!.count;
+  }
+
+  flush(): void {
+    this.mesh.visible = this.indices > 0;
+    if (!this.indices) return;
+    const allocated = this.vertices > this.vertexCapacity || this.indices > this.indexCapacity;
+    if (allocated) {
+      this.vertexCapacity = Math.max(this.vertexCapacity, 256, 2 ** Math.ceil(Math.log2(this.vertices)));
+      this.indexCapacity = Math.max(this.indexCapacity, 512, 2 ** Math.ceil(Math.log2(this.indices)));
+      this.mesh.geometry.dispose();
+      const geometry = (this.mesh.geometry = new BufferGeometry());
+      for (const [name, size] of [
+        ["position", 3],
+        ["uv", 2],
+        ["color", 4],
+      ] as const) {
+        geometry.setAttribute(
+          name,
+          new BufferAttribute(new Float32Array(this.vertexCapacity * size), size).setUsage(
+            name === "position" ? StreamDrawUsage : DynamicDrawUsage,
+          ),
+        );
+      }
+      geometry.setIndex(new BufferAttribute(new Uint32Array(this.indexCapacity), 1).setUsage(DynamicDrawUsage));
+    }
+    const geometry = this.mesh.geometry;
+    const positions = geometry.getAttribute("position") as BufferAttribute;
+    const uv = geometry.getAttribute("uv") as BufferAttribute;
+    const colors = geometry.getAttribute("color") as BufferAttribute;
+    const indices = geometry.index!;
+    let vertex = 0,
+      index = 0,
+      sourceCursor = 0;
+    let topologyChanged = false,
+      colorsChanged = false;
+    for (const mesh of this.sources) {
+      mesh.updateMatrix();
+      this.transform.multiplyMatrices(mesh.parent!.matrix, mesh.matrix);
+      const matrix = this.transform.elements;
+      const source = mesh.geometry.getAttribute("position");
+      const sourceUv = mesh.geometry.getAttribute("uv") as BufferAttribute;
+      const sourceIndex = mesh.geometry.index!;
+      const texture = mesh.material.map!;
+      const color = mesh.material.color,
+        alpha = mesh.material.opacity;
+      const cached = (this.sourceCache[sourceCursor++] ??= {});
+      const topology =
+        allocated ||
+        cached.mesh !== mesh ||
+        cached.geometry !== mesh.geometry ||
+        cached.map !== texture ||
+        cached.uvVersion !== sourceUv.version ||
+        cached.indexVersion !== sourceIndex.version ||
+        cached.vertexOffset !== vertex ||
+        cached.indexOffset !== index;
+      const tint =
+        topology || cached.r !== color.r || cached.g !== color.g || cached.b !== color.b || cached.alpha !== alpha;
+      topologyChanged ||= topology;
+      colorsChanged ||= tint;
+      if (topology && texture.matrixAutoUpdate) texture.updateMatrix();
+      const textureMatrix = texture.matrix.elements;
+      for (let local = 0; local < source.count; local++) {
+        const x = source.getX(local),
+          y = source.getY(local),
+          z = source.getZ(local);
+        positions.setXYZ(
+          vertex + local,
+          matrix[0]! * x + matrix[4]! * y + matrix[8]! * z + matrix[12]!,
+          matrix[1]! * x + matrix[5]! * y + matrix[9]! * z + matrix[13]!,
+          matrix[2]! * x + matrix[6]! * y + matrix[10]! * z + matrix[14]!,
+        );
+        if (topology) {
+          const u = sourceUv.getX(local),
+            v = sourceUv.getY(local);
+          uv.setXY(
+            vertex + local,
+            textureMatrix[0]! * u + textureMatrix[3]! * v + textureMatrix[6]!,
+            textureMatrix[1]! * u + textureMatrix[4]! * v + textureMatrix[7]!,
+          );
+        }
+        if (tint) colors.setXYZW(vertex + local, color.r, color.g, color.b, alpha);
+      }
+      if (topology)
+        for (let local = 0; local < sourceIndex.count; local++)
+          indices.setX(index + local, vertex + sourceIndex.getX(local));
+      cached.mesh = mesh;
+      cached.geometry = mesh.geometry;
+      cached.map = texture;
+      cached.uvVersion = sourceUv.version;
+      cached.indexVersion = sourceIndex.version;
+      cached.vertexOffset = vertex;
+      cached.indexOffset = index;
+      cached.r = color.r;
+      cached.g = color.g;
+      cached.b = color.b;
+      cached.alpha = alpha;
+      index += sourceIndex.count;
+      vertex += source.count;
+    }
+    this.upload(positions, vertex * 3);
+    if (topologyChanged) {
+      this.upload(uv, vertex * 2);
+      this.upload(indices, index);
+    }
+    if (colorsChanged) this.upload(colors, vertex * 4);
+    geometry.setDrawRange(0, index);
+  }
+
+  private upload(attribute: BufferAttribute, count: number): void {
+    attribute.clearUpdateRanges();
+    attribute.addUpdateRange(0, count);
+    attribute.needsUpdate = true;
+  }
+
+  dispose(): void {
+    this.mesh.geometry.dispose();
+    this.mesh.material.dispose();
+  }
+}
+
 export interface EaseNoteMarkPresentation {
   /** Whether this note view owns the mark SpriteRenderer affected by the option. */
   hasMark: boolean;
@@ -127,6 +299,7 @@ export class NoteLayer {
   private visualReleases = 0;
   private meshAllocations = 0;
   private isShowEaseNote = false;
+  private batches?: { body: NoteAtlasBatch; mark: NoteAtlasBatch; arrow: NoteAtlasBatch };
 
   constructor(projector: StageProjector, assets: OurNotesAssetManifest) {
     this.projector = projector;
@@ -139,6 +312,33 @@ export class NoteLayer {
     this.descriptors.clear();
     this.bounds.clear();
     this.atlas = atlas;
+    if (atlas) {
+      this.batches = {
+        body: new NoteAtlasBatch(this.bodyMaterial(), OUR_NOTES_LIVE_GEOMETRY.sortingOrders.note),
+        mark: new NoteAtlasBatch(this.bodyMaterial(), OUR_NOTES_LIVE_GEOMETRY.sortingOrders.noteDecoration),
+        arrow: new NoteAtlasBatch(this.bodyMaterial(), OUR_NOTES_LIVE_GEOMETRY.sortingOrders.noteArrow),
+      };
+      for (const batch of Object.values(this.batches)) this.group.add(batch.mesh);
+      this.meshAllocations += 3;
+    }
+  }
+
+  beginWarmup(): () => void {
+    const states = Object.values(this.batches ?? {}).map((batch) => ({
+      mesh: batch.mesh,
+      visible: batch.mesh.visible,
+      count: batch.mesh.geometry.drawRange.count,
+    }));
+    for (const { mesh } of states) {
+      mesh.visible = true;
+      mesh.geometry.setDrawRange(0, 3);
+    }
+    return () => {
+      for (const { mesh, visible, count } of states) {
+        mesh.visible = visible;
+        mesh.geometry.setDrawRange(0, count);
+      }
+    };
   }
 
   /** Mirrors the live-view ease-note option; disabled by default. */
@@ -149,6 +349,10 @@ export class NoteLayer {
   update(notes: ReadonlyArray<RenderNote> | undefined, timeSeconds = 0): void {
     const epoch = ++this.updateEpoch;
     let drawOrdinal = 0;
+    const batches = this.batches;
+    batches?.body.begin();
+    batches?.mark.begin();
+    batches?.arrow.begin();
     for (const note of notes ?? []) {
       if (note.visible === false) continue;
       const descriptor = this.descriptor(note);
@@ -159,42 +363,68 @@ export class NoteLayer {
         visual.gradientStartedAt = timeSeconds;
         this.visuals.set(note.id, visual);
         this.group.add(visual.root);
+        if (batches) {
+          const children = this.group.children;
+          children.splice(children.indexOf(visual.root), 1);
+          children.splice(children.indexOf(batches.body.mesh), 0, visual.root);
+        }
       }
       visual.lastSeen = epoch;
       this.setSortOrder(visual, drawOrdinal++);
       this.layout(visual, note, timeSeconds);
+      if (batches) {
+        visual.body.layers.set(31);
+        visual.decoration?.layers.set(31);
+        if (visual.arrow && !visual.arrowGradientMaterial) visual.arrow.layers.set(31);
+        if (visual.root.visible) {
+          visual.root.updateMatrix();
+          batches.body.add(visual.body);
+          if (visual.decoration) batches.mark.add(visual.decoration);
+          if (visual.arrow && !visual.arrowGradientMaterial)
+            batches.arrow.add(visual.arrow as Mesh<BufferGeometry, MeshBasicMaterial>);
+        }
+      }
     }
     for (const [id, visual] of this.visuals) {
       if (visual.lastSeen !== epoch) this.releaseVisual(id, visual);
     }
     if (this.assets.arrowGradient) this.updateArrowGradient(timeSeconds);
+    batches?.body.flush();
+    batches?.mark.flush();
+    batches?.arrow.flush();
   }
 
   /** Hit the currently displayed native sprite triangles, including flick arrows and marks. */
   pickNote(raycaster: Raycaster): NativeNoteHit | undefined {
-    this.group.updateWorldMatrix(true, true);
-    let selected: NativeNoteHit | undefined;
-    let order = Number.NEGATIVE_INFINITY;
-    for (const [id, visual] of this.visuals) {
-      if (!visual.root.visible) continue;
-      const parts = [
-        [visual.body, "body"],
-        [visual.decoration, "mark"],
-        [visual.arrow, "arrow"],
-      ] as const;
-      for (const [mesh, part] of parts) {
-        if (!mesh?.visible || mesh.renderOrder < order) continue;
-        const opacity =
-          mesh.material instanceof ShaderMaterial
-            ? (mesh.material.uniforms.uOpacity?.value ?? 1)
-            : mesh.material.opacity;
-        if (opacity <= 0.001 || !mesh.material.colorWrite) continue;
-        if (raycaster.intersectObject(mesh, false).length === 0) continue;
-        selected = { id, part };
-        order = mesh.renderOrder;
+    const mask = raycaster.layers.mask;
+    raycaster.layers.enable(31);
+    try {
+      this.group.updateWorldMatrix(true, true);
+      let selected: NativeNoteHit | undefined;
+      let order = Number.NEGATIVE_INFINITY;
+      for (const [id, visual] of this.visuals) {
+        if (!visual.root.visible) continue;
+        const parts = [
+          [visual.body, "body"],
+          [visual.decoration, "mark"],
+          [visual.arrow, "arrow"],
+        ] as const;
+        for (const [mesh, part] of parts) {
+          if (!mesh?.visible || mesh.renderOrder < order) continue;
+          const opacity =
+            mesh.material instanceof ShaderMaterial
+              ? (mesh.material.uniforms.uOpacity?.value ?? 1)
+              : mesh.material.opacity;
+          if (opacity <= 0.001 || !mesh.material.colorWrite) continue;
+          if (raycaster.intersectObject(mesh, false).length === 0) continue;
+          selected = { id, part };
+          order = mesh.renderOrder;
+        }
       }
+      return selected;
+    } finally {
+      raycaster.layers.mask = mask;
     }
-    return selected;
   }
 
   /** Each ArrowGradientAnimator starts its sweep when its note view is acquired. */
@@ -853,6 +1083,8 @@ export class NoteLayer {
       for (const visual of pool) this.disposeVisual(visual);
     }
     this.pools.clear();
+    if (this.batches) for (const batch of Object.values(this.batches)) batch.dispose();
+    this.batches = undefined;
     this.group.clear();
   }
 

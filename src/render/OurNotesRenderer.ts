@@ -21,7 +21,7 @@ import {
   VideoTexture,
   WebGLRenderer,
 } from "three";
-import type { Object3D, WebGLRenderTarget } from "three";
+import type { Material, Object3D, WebGLRenderTarget } from "three";
 import { OUR_NOTES_LIVE_GEOMETRY } from "@haneoka/cassiopeia-plugin-our-notes";
 import { SpriteAtlas } from "../assets/SpriteAtlas";
 import { dynamicCanvasFrameChanged, refreshDynamicCanvasTexture } from "./backgroundMedia";
@@ -336,11 +336,93 @@ export class OurNotesRenderer implements NativeChartPresentation {
     this.configureGammaMaterials(this.stage.group);
     this.configureGammaMaterials(this.screenLane.scene, false);
     this.configureGammaMaterials(this.screenLane.backgroundScene);
+    await this.prepareShaders();
+    if (this.disposed) return;
+    await this.prepareGraphics();
+    if (this.disposed) return;
     this.assetsReady = true;
     // A paused frame may stay in one native 30-fps bucket while the decoded
     // effect assets arrive. Force that bucket to be rendered again.
     this.liveBloom.invalidate();
     this.effectCacheActive = false;
+  }
+
+  private async prepareShaders(): Promise<void> {
+    const materials = this.gameCompositor.compile(this.renderer, () => {
+      const result = new Set<Material>();
+      for (const [scene, camera] of [
+        [this.scene, this.camera],
+        [this.effectScene, this.camera],
+        [this.screenLane.scene, this.screenLane.camera],
+        [this.screenLane.backgroundScene, this.screenLane.camera],
+      ] as const) {
+        for (const material of this.renderer.compile(scene, camera)) result.add(material);
+      }
+      for (const material of this.holds.prepareShader(this.renderer, this.camera, this.scene)) result.add(material);
+      return result;
+    });
+    for (const material of this.liveBloom.compile(this.renderer)) materials.add(material);
+    await new Promise<void>((resolve) => {
+      const check = () => {
+        if (this.disposed || this.renderer.getContext().isContextLost()) {
+          resolve();
+          return;
+        }
+        for (const material of materials) {
+          const properties = this.renderer.properties.get(material) as { currentProgram: { isReady(): boolean } };
+          if (properties.currentProgram.isReady()) materials.delete(material);
+        }
+        if (materials.size) setTimeout(check, 10);
+        else resolve();
+      };
+      check();
+    });
+  }
+
+  private async prepareGraphics(): Promise<void> {
+    const restore = [
+      this.notes.beginWarmup(),
+      this.simultaneousLines.beginWarmup(),
+      this.holds.beginWarmup(),
+      this.particles.beginWarmup(),
+    ];
+    const gl = this.renderer.getContext() as WebGL2RenderingContext;
+    try {
+      this.camera.updateMatrixWorld(true);
+      this.liveBloom.renderEffect(this.renderer, this.drawEffectScene);
+      this.gameCompositor.renderGame(this.renderer, this.drawGameScene);
+      this.gameCompositor.renderMain(
+        this.renderer,
+        this.drawMainBackground,
+        this.compositeEffects,
+        this.drawMainUnderlays,
+      );
+      const fence = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
+      if (!fence) throw new Error("Unable to prepare rendering pipelines");
+      gl.flush();
+      try {
+        await new Promise<void>((resolve, reject) => {
+          const check = () => {
+            if (this.disposed || gl.isContextLost()) {
+              resolve();
+              return;
+            }
+            const status = gl.clientWaitSync(fence, 0, 0);
+            if (status === gl.WAIT_FAILED) {
+              reject(new Error("Unable to prepare rendering pipelines"));
+              return;
+            }
+            if (status === gl.ALREADY_SIGNALED || status === gl.CONDITION_SATISFIED) resolve();
+            else setTimeout(check, 10);
+          };
+          check();
+        });
+      } finally {
+        gl.deleteSync(fence);
+      }
+    } finally {
+      for (const reset of restore) reset();
+    }
   }
 
   /** Native Gamma textures sample their stored bytes, including bilinear interpolation. */

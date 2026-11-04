@@ -18,7 +18,7 @@ import {
   UnsignedByteType,
   Vector4,
 } from "three";
-import type { Texture } from "three";
+import type { Camera, Material, Scene, Texture, WebGLRenderer } from "three";
 import {
   OUR_NOTES_LIVE_GEOMETRY,
   type OurNotesAssetManifest,
@@ -474,10 +474,33 @@ export class HoldRibbonLayer {
       return pooled;
     }
     this.visualAllocations += 1;
-    return this.createVisual(hold);
+    return this.createVisual(hold.id);
   }
 
-  private createVisual(hold: NativeRenderHold): HoldVisual {
+  prepareShader(renderer: WebGLRenderer, camera: Camera, scene: Scene): Set<Material> {
+    let visual = this.pool[0] ?? this.visuals.values().next().value;
+    if (!visual) {
+      visual = this.createVisual("");
+      this.visualAllocations++;
+      this.ensureCapacity(visual, 2);
+      visual.mesh.visible = false;
+      this.pool.push(visual);
+    }
+    return renderer.compile(visual.mesh, camera, scene);
+  }
+
+  beginWarmup(): () => void {
+    const visual = this.pool[0]!;
+    visual.mesh.visible = true;
+    visual.geometry.setDrawRange(0, 18);
+    this.group.add(visual.mesh);
+    return () => {
+      this.group.remove(visual.mesh);
+      visual.mesh.visible = false;
+    };
+  }
+
+  private createVisual(id: NativeRenderHold["id"]): HoldVisual {
     const geometry = new BufferGeometry();
     const material = makeMaterial(
       this.slideTexture ?? this.fallbackTexture,
@@ -486,7 +509,7 @@ export class HoldRibbonLayer {
       this.style,
     );
     const mesh = new Mesh(geometry, material);
-    mesh.name = `HoldRibbon:${String(hold.id)}`;
+    mesh.name = `HoldRibbon:${String(id)}`;
     mesh.frustumCulled = false;
     // Slide line view MeshRenderer: m_SortingOrder=4999.
     mesh.renderOrder = OUR_NOTES_LIVE_GEOMETRY.sortingOrders.holdLine;

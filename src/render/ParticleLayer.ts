@@ -2694,6 +2694,24 @@ export class ParticleLayer {
     // scaling was a simulator invention and is intentionally absent.
   }
 
+  beginWarmup(): () => void {
+    const states = [...this.batchList, ...this.impactBatchList, this.laneEffectBatch].map((batch) => ({
+      mesh: batch.mesh,
+      visible: batch.mesh.visible,
+      count: batch.mesh.geometry.instanceCount,
+    }));
+    for (const { mesh } of states) {
+      mesh.visible = true;
+      mesh.geometry.instanceCount = 1;
+    }
+    return () => {
+      for (const { mesh, visible, count } of states) {
+        mesh.visible = visible;
+        mesh.geometry.instanceCount = count;
+      }
+    };
+  }
+
   /**
    * Route every emitted instance to `sink` as well as the GPU batches. With a
    * sink, frame/pillar/wall instances are traced even without decoded textures.

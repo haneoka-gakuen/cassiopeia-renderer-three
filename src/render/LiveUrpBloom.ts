@@ -26,7 +26,7 @@ import {
   WebGLRenderTarget,
   WebGLRenderer,
 } from "three";
-import type { IUniform, Texture } from "three";
+import type { IUniform, Material, Texture } from "three";
 
 /**
  * LiveEffectCamera configuration.
@@ -513,6 +513,25 @@ export class LiveGameCompositor {
     }
   }
 
+  compile(renderer: WebGLRenderer, compileGame: () => Set<Material>): Set<Material> {
+    const previousTarget = renderer.getRenderTarget(),
+      previousMaterial = this.mesh.material;
+    const materials = new Set<Material>();
+    try {
+      renderer.setRenderTarget(this.gameTarget);
+      for (const material of compileGame()) materials.add(material);
+      this.mesh.material = this.gameMaterial;
+      for (const material of renderer.compile(this.scene, this.camera)) materials.add(material);
+      renderer.setRenderTarget(null);
+      this.mesh.material = this.outputMaterial;
+      for (const material of renderer.compile(this.scene, this.camera)) materials.add(material);
+    } finally {
+      this.mesh.material = previousMaterial;
+      renderer.setRenderTarget(previousTarget);
+    }
+    return materials;
+  }
+
   renderMain(
     renderer: WebGLRenderer,
     drawBackground: () => void,
@@ -721,6 +740,31 @@ export class LiveUrpBloomPipeline {
     this.renderFullscreen(renderer, this.fxaaMaterial, this.effectOutputTarget);
     renderer.setRenderTarget(previousTarget);
     this.ready = true;
+  }
+
+  compile(renderer: WebGLRenderer): Set<Material> {
+    const previousTarget = renderer.getRenderTarget(),
+      previousMaterial = this.fullscreenMesh.material;
+    const materials = new Set<Material>();
+    try {
+      renderer.setRenderTarget(this.effectTarget);
+      for (const material of [
+        this.prefilterMaterial,
+        this.horizontalMaterial,
+        this.verticalMaterial,
+        this.upsampleMaterial,
+        this.postMaterial,
+        this.fxaaMaterial,
+        this.compositeMaterial,
+      ]) {
+        this.fullscreenMesh.material = material;
+        for (const compiled of renderer.compile(this.fullscreenScene, this.fullscreenCamera)) materials.add(compiled);
+      }
+    } finally {
+      this.fullscreenMesh.material = previousMaterial;
+      renderer.setRenderTarget(previousTarget);
+    }
+    return materials;
   }
 
   /** Add cached effect-camera output to the base-camera framebuffer. */
