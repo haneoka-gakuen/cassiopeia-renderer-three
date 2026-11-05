@@ -1088,7 +1088,6 @@ class ParticleQuadBatch {
         }
         void main() {
           vec4 texel = texture2D(uMap, vUv);
-          if (texel.a == 0.0 || vColor.a == 0.0) discard;
           // Compiled fragment program quantizes vertex alpha to Color32,
           // after the vertex stage has applied both tint factors and doubled it.
           vec4 hdrColor;
@@ -1284,7 +1283,6 @@ class EffectMeshBatch {
             varying vec4 vColor;
             void main() {
               vec4 color = texture2D(uMap, vUv) * vColor;
-              if (color.a == 0.0) discard;
               // Compiled UI/Additive GLES3 program premultiplies RGB, then
               // the fixed One/One blend state adds it to the framebuffer.
               gl_FragColor = vec4(color.rgb * color.a, color.a);
@@ -1304,7 +1302,6 @@ class EffectMeshBatch {
             }
             void main() {
               vec4 texel = texture2D(uMap, vUv);
-              if (texel.a == 0.0 || vColor.a == 0.0) discard;
               vec4 hdrColor;
               hdrColor.rgb = vColor.rgb;
               hdrColor.a = roundEvenPositive(vColor.a * 255.0) / 255.0;
