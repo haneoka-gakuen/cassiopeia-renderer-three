@@ -1079,20 +1079,13 @@ class ParticleQuadBatch {
 
         varying vec2 vUv;
         varying vec4 vColor;
-        float roundEvenPositive(float value) {
-          float lower = floor(value);
-          float fraction = value - lower;
-          if (fraction < 0.5) return lower;
-          if (fraction > 0.5) return lower + 1.0;
-          return mod(lower, 2.0) == 0.0 ? lower : lower + 1.0;
-        }
         void main() {
           vec4 texel = texture2D(uMap, vUv);
           // Compiled fragment program quantizes vertex alpha to Color32,
           // after the vertex stage has applied both tint factors and doubled it.
           vec4 hdrColor;
           hdrColor.rgb = vColor.rgb;
-          hdrColor.a = roundEvenPositive(vColor.a * 255.0) / 255.0;
+          hdrColor.a = roundEven(vColor.a * 255.0) / 255.0;
           float alpha = texel.a * hdrColor.a;
           gl_FragColor = vec4(texel.rgb * hdrColor.rgb, alpha);
         }
@@ -1293,18 +1286,11 @@ class EffectMeshBatch {
 
             varying vec2 vUv;
             varying vec4 vColor;
-            float roundEvenPositive(float value) {
-              float lower = floor(value);
-              float fraction = value - lower;
-              if (fraction < 0.5) return lower;
-              if (fraction > 0.5) return lower + 1.0;
-              return mod(lower, 2.0) == 0.0 ? lower : lower + 1.0;
-            }
             void main() {
               vec4 texel = texture2D(uMap, vUv);
               vec4 hdrColor;
               hdrColor.rgb = vColor.rgb;
-              hdrColor.a = roundEvenPositive(vColor.a * 255.0) / 255.0;
+              hdrColor.a = roundEven(vColor.a * 255.0) / 255.0;
               float alpha = texel.a * hdrColor.a;
               gl_FragColor = vec4(texel.rgb * hdrColor.rgb, alpha);
             }
@@ -1733,9 +1719,9 @@ function integratedUnconstrainedVelocity(
   let px = initialPosition[0];
   let py = initialPosition[1];
   let pz = initialPosition[2];
-  let baseVelocityX = initialVelocity[0];
+  const baseVelocityX = initialVelocity[0];
   let baseVelocityY = initialVelocity[1];
-  let baseVelocityZ = initialVelocity[2];
+  const baseVelocityZ = initialVelocity[2];
   const normalized = clamp((0.5 * delta) / Math.max(Number.EPSILON, lifetime));
   let vx =
     velocity?.enabled === true
