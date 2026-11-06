@@ -215,7 +215,7 @@ function fontData(asset: UnityTmpFontAsset | PortableTmpFontAsset): UnityTmpFont
 export class TmpSdfFont {
   private readonly characters = new Map<number, Character>();
   private readonly pairAdjustments = new Map<string, PairAdjustment>();
-  private readonly maskAtlases = new Map<number, HTMLCanvasElement>();
+  private readonly textLayouts = new Map<string, TextLayout>();
   private readonly tintedGlyphs = new Map<string, HTMLCanvasElement>();
   private readonly atlasAlpha: Uint8ClampedArray;
   private disposed = false;
@@ -411,6 +411,9 @@ export class TmpSdfFont {
 
   private layout(text: string, fontSize: number, characterSpacing: number): TextLayout | undefined {
     if (this.disposed || !Number.isFinite(fontSize) || fontSize <= 0) return undefined;
+    const key = `${fontSize}:${characterSpacing}:${text}`;
+    const cached = this.textLayouts.get(key);
+    if (cached) return cached;
     const characters: PositionedCharacter[] = [];
     for (const value of text) {
       const character = this.characters.get(value.codePointAt(0)!);
@@ -439,33 +442,10 @@ export class TmpSdfFont {
         positioned.advanceAdjustment * scale +
         (index + 1 < characters.length ? characterSpacing : 0);
     }
-    return { characters, scale, width: Math.max(0, width) };
-  }
-
-  private maskAtlas(fontSize: number): HTMLCanvasElement | undefined {
-    const key = Math.round(fontSize * 1024) / 1024;
-    const cached = this.maskAtlases.get(key);
-    if (cached) return cached;
-    if (this.disposed) return undefined;
-    const canvas = document.createElement("canvas");
-    canvas.width = this.atlasWidth;
-    canvas.height = this.atlasHeight;
-    const context = canvas.getContext("2d");
-    if (!context) return undefined;
-    const image = context.createImageData(this.atlasWidth, this.atlasHeight);
-    // TMP's default material has zero face dilate/weight. GradientScale is
-    // generated as atlas padding + 1 (12 + 1 for this exact font asset).
-    const distanceScale = Math.max(1, (this.atlasPadding + 1) * (key / this.pointSize) * this.faceScale);
-    for (let pixel = 0, target = 0; pixel < this.atlasAlpha.length; pixel += 1, target += 4) {
-      const coverage = clamp((this.atlasAlpha[pixel]! / 255 - 0.5) * distanceScale + 0.5);
-      image.data[target] = 255;
-      image.data[target + 1] = 255;
-      image.data[target + 2] = 255;
-      image.data[target + 3] = Math.round(coverage * 255);
-    }
-    context.putImageData(image, 0, 0);
-    this.maskAtlases.set(key, canvas);
-    return canvas;
+    const result = { characters, scale, width: Math.max(0, width) };
+    if (this.textLayouts.size >= 256) this.textLayouts.delete(this.textLayouts.keys().next().value!);
+    this.textLayouts.set(key, result);
+    return result;
   }
 
   private tintedGlyph(glyph: Glyph, fontSize: number, color: string): HTMLCanvasElement | undefined {
@@ -473,8 +453,7 @@ export class TmpSdfFont {
     const key = `${sizeKey}:${color}:${glyph.index}`;
     const cached = this.tintedGlyphs.get(key);
     if (cached) return cached;
-    const atlas = this.maskAtlas(sizeKey);
-    if (!atlas) return undefined;
+    if (this.disposed) return undefined;
     const width = Math.max(1, glyph.rect.width);
     const height = Math.max(1, glyph.rect.height);
     const canvas = document.createElement("canvas");
@@ -483,7 +462,20 @@ export class TmpSdfFont {
     const context = canvas.getContext("2d");
     if (!context) return undefined;
     const sourceY = this.atlasHeight - glyph.rect.y - glyph.rect.height;
-    context.drawImage(atlas, glyph.rect.x, sourceY, width, height, 0, 0, width, height);
+    const image = context.createImageData(width, height);
+    const distanceScale = Math.max(1, (this.atlasPadding + 1) * (sizeKey / this.pointSize) * this.faceScale);
+    for (let y = 0; y < height; y++) {
+      const source = (sourceY + y) * this.atlasWidth + glyph.rect.x;
+      for (let x = 0; x < width; x++) {
+        const target = (y * width + x) * 4;
+        const coverage = clamp((this.atlasAlpha[source + x]! / 255 - 0.5) * distanceScale + 0.5);
+        image.data[target] = 255;
+        image.data[target + 1] = 255;
+        image.data[target + 2] = 255;
+        image.data[target + 3] = Math.round(coverage * 255);
+      }
+    }
+    context.putImageData(image, 0, 0);
     context.globalCompositeOperation = "source-in";
     context.fillStyle = color;
     context.fillRect(0, 0, width, height);
@@ -495,16 +487,12 @@ export class TmpSdfFont {
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
-    for (const canvas of this.maskAtlases.values()) {
-      canvas.width = 1;
-      canvas.height = 1;
-    }
     for (const canvas of this.tintedGlyphs.values()) {
       canvas.width = 1;
       canvas.height = 1;
     }
-    this.maskAtlases.clear();
     this.tintedGlyphs.clear();
+    this.textLayouts.clear();
     this.characters.clear();
     this.pairAdjustments.clear();
   }
