@@ -896,16 +896,22 @@ function particleSimulationClock(
   age: number,
 ): ParticleSimulationClock {
   const delay = evaluateNativeMinMaxCurve(system.raw.startDelay, 0, random(seed + 1));
+  let integratedThrough = 0;
+  let simulated = 0;
+  const integrate = (start: number, step: number) =>
+    particleSystemSimulationSpeedAt(system, manifest, animation, animationTimeOffset + start + step / 2) * step;
   const timeAt = (realTime: number): number => {
     const duration = Math.max(0, realTime);
-    let simulated = 0;
-    for (let start = 0; start < duration; start += EMISSION_STEP) {
-      const step = Math.min(EMISSION_STEP, duration - start);
-      simulated +=
-        particleSystemSimulationSpeedAt(system, manifest, animation, animationTimeOffset + start + step / 2) *
-        step;
+    if (duration < integratedThrough) {
+      integratedThrough = 0;
+      simulated = 0;
     }
-    return Math.max(0, simulated - delay);
+    while (duration - integratedThrough >= EMISSION_STEP) {
+      simulated += integrate(integratedThrough, EMISSION_STEP);
+      integratedThrough += EMISSION_STEP;
+    }
+    const remainder = duration - integratedThrough;
+    return Math.max(0, simulated + (remainder > 0 ? integrate(integratedThrough, remainder) : 0) - delay);
   };
   return { current: timeAt(age), timeAt };
 }
@@ -2148,11 +2154,14 @@ function emissionEvents(
     movementAt(prefab, judgementAnimation, animationTimeOffset, MOVEMENT_PREVIOUS_SCRATCH);
     let distanceAccumulator = 0;
     let hasSimulationTime = !simulationClock;
+    let previousSimulationTime = 0;
     for (let realTime = EMISSION_STEP; realTime <= realDuration + Number.EPSILON; realTime += EMISSION_STEP) {
       const currentTime = Math.min(realDuration, realTime);
       movementAt(prefab, judgementAnimation, animationTimeOffset + currentTime, MOVEMENT_CURRENT_SCRATCH);
       const currentSimulationTime =
         simulationClock?.timeAt(currentTime) ?? currentTime * system.simulationSpeed;
+      const segmentStart = previousSimulationTime;
+      previousSimulationTime = currentSimulationTime;
       if (currentSimulationTime <= 0) {
         MOVEMENT_PREVIOUS_SCRATCH[0] = MOVEMENT_CURRENT_SCRATCH[0];
         MOVEMENT_PREVIOUS_SCRATCH[1] = MOVEMENT_CURRENT_SCRATCH[1];
@@ -2177,12 +2186,9 @@ function emissionEvents(
             ) ?? distanceRate,
           )
         : distanceRate;
-      const previousTime = Math.max(0, currentTime - EMISSION_STEP);
-      const previousSimulationTime =
-        simulationClock?.timeAt(previousTime) ?? previousTime * system.simulationSpeed;
       // The distance module consumes world-space travel. The simulation
       // clock only determines the age of births along that travelled segment.
-      if (!system.looping && previousSimulationTime >= system.length) break;
+      if (!system.looping && segmentStart >= system.length) break;
       const displacement = Math.hypot(
         (MOVEMENT_CURRENT_SCRATCH[0] - MOVEMENT_PREVIOUS_SCRATCH[0]) * distanceScaleX,
         MOVEMENT_CURRENT_SCRATCH[1] - MOVEMENT_PREVIOUS_SCRATCH[1],
@@ -2199,7 +2205,7 @@ function emissionEvents(
         const fraction = clamp(crossing / Math.max(Number.EPSILON, emittedDistanceCount));
         appendEmission(
           system,
-          lerp(previousSimulationTime, currentSimulationTime, fraction),
+          lerp(segmentStart, currentSimulationTime, fraction),
           lerp(MOVEMENT_PREVIOUS_SCRATCH[0], MOVEMENT_CURRENT_SCRATCH[0], fraction),
           lerp(MOVEMENT_PREVIOUS_SCRATCH[1], MOVEMENT_CURRENT_SCRATCH[1], fraction),
           lerp(MOVEMENT_PREVIOUS_SCRATCH[2], MOVEMENT_CURRENT_SCRATCH[2], fraction),
