@@ -140,6 +140,8 @@ interface ParticleEmission {
   index: number;
   shapeBirthWidth?: number;
   motion?: CachedParticleMotion;
+  lifetimeSeed?: number;
+  lifetime?: number;
 }
 
 interface CachedParticleMotion extends NativeParticleMotionState {
@@ -1036,6 +1038,8 @@ class ParticleQuadBatch {
           // Compiled Custom/Mobile/MobileAddHdrColor GLES3 vertex program:
           //     vs_COLOR0 = in_COLOR0 * _TintColor * _TintColor * 2
           vColor = aColor * aTint * aTint * 2.0;
+          // Every corner shares the same Color32 value.
+          vColor.a = roundEven(vColor.a * 255.0) / 255.0;
           // Vertical billboards share the camera direction and retain world Y,
           // matching the authored renderer and the other rendering backends.
           vec4 worldCenter = modelMatrix * vec4(aCenter, 1.0);
@@ -1081,13 +1085,7 @@ class ParticleQuadBatch {
         varying vec4 vColor;
         void main() {
           vec4 texel = texture2D(uMap, vUv);
-          // Compiled fragment program quantizes vertex alpha to Color32,
-          // after the vertex stage has applied both tint factors and doubled it.
-          vec4 hdrColor;
-          hdrColor.rgb = vColor.rgb;
-          hdrColor.a = roundEven(vColor.a * 255.0) / 255.0;
-          float alpha = texel.a * hdrColor.a;
-          gl_FragColor = vec4(texel.rgb * hdrColor.rgb, alpha);
+          gl_FragColor = texel * vColor;
         }
       `,
       transparent: true,
@@ -1133,7 +1131,7 @@ class ParticleQuadBatch {
     materialTint?: readonly [number, number, number, number],
     renderMode: 0 | 2 | 3 = 3,
   ): boolean {
-    if (this.cursor >= this.capacity) return false;
+    if (color.a === 0 || sizeX === 0 || sizeY === 0 || this.cursor >= this.capacity) return false;
     this.center.setXYZ(this.cursor, x, y, z);
     this.size.setXY(this.cursor, sizeX, sizeY);
     this.color.setXYZW(this.cursor, color.r, color.g, color.b, color.a);
@@ -1248,23 +1246,26 @@ class EffectMeshBatch {
             offset.x = position.x < -1.0
               ? -aScale.x * 0.5
               : position.x < 0.0
-                ? -aScale.x * 0.5 + uSliceBorder.x
+                ? -aScale.x * 0.5 + uSliceBorder.x * sign(aScale.x)
                 : position.x < 1.0
-                  ? aScale.x * 0.5 - uSliceBorder.x
+                  ? aScale.x * 0.5 - uSliceBorder.x * sign(aScale.x)
                   : aScale.x * 0.5;
             offset.y = position.y < -1.0
               ? -aScale.y * 0.5
               : position.y < 0.0
-                ? -aScale.y * 0.5 + uSliceBorder.y
+                ? -aScale.y * 0.5 + uSliceBorder.y * sign(aScale.y)
                 : position.y < 1.0
-                  ? aScale.y * 0.5 - uSliceBorder.y
+                  ? aScale.y * 0.5 - uSliceBorder.y * sign(aScale.y)
                   : aScale.y * 0.5;
           }
           float cosine = cos(aRotationX);
           float sine = sin(aRotationX);
           offset.yz = mat2(cosine, sine, -sine, cosine) * offset.yz;
           vUv = uv;
-          vColor = ${shaderMode === "uiAdditive" ? "aColor * aTint" : "aColor * aTint * aTint * 2.0"};
+          ${shaderMode === "uiAdditive" ? "vColor = aColor * aTint;" : `
+            vColor = aColor * aTint * aTint * 2.0;
+            vColor.a = roundEven(vColor.a * 255.0) / 255.0;
+          `}
           gl_Position = projectionMatrix * modelViewMatrix * vec4(aCenter + offset, 1.0);
         }
       `,
@@ -1287,12 +1288,7 @@ class EffectMeshBatch {
             varying vec2 vUv;
             varying vec4 vColor;
             void main() {
-              vec4 texel = texture2D(uMap, vUv);
-              vec4 hdrColor;
-              hdrColor.rgb = vColor.rgb;
-              hdrColor.a = roundEven(vColor.a * 255.0) / 255.0;
-              float alpha = texel.a * hdrColor.a;
-              gl_FragColor = vec4(texel.rgb * hdrColor.rgb, alpha);
+              gl_FragColor = texture2D(uMap, vUv) * vColor;
             }
           `,
       transparent: true,
@@ -1336,7 +1332,7 @@ class EffectMeshBatch {
     rotationX = 0,
     materialTint?: readonly [number, number, number, number],
   ): boolean {
-    if (this.cursor >= this.capacity) return false;
+    if (alpha === 0 || this.cursor >= this.capacity) return false;
     this.center.setXYZ(this.cursor, x, y, z);
     this.scale.setXYZ(this.cursor, scaleX, scaleY, scaleZ);
     this.color.setXYZW(this.cursor, red, green, blue, alpha);
@@ -1557,9 +1553,9 @@ export function nativeMeshQuads(trace: NativeMeshTrace): NativeWorldQuad[] {
         tag < -1
           ? -scale * 0.5
           : tag < 0
-            ? -scale * 0.5 + border
+            ? -scale * 0.5 + border * Math.sign(scale)
             : tag < 1
-              ? scale * 0.5 - border
+              ? scale * 0.5 - border * Math.sign(scale)
               : scale * 0.5;
       x = slice(px!, trace.scaleX, FRAME_SLICE_BORDER[0]);
       y = slice(py!, trace.scaleY, FRAME_SLICE_BORDER[1]);
@@ -1844,15 +1840,17 @@ function sampleParticle(
   // Keep deterministic, independent channels for different particle modules.
   // Reusing one factor artificially ties large particles to short lifetimes
   // and slow velocities whenever the authored ranges run in opposite orders.
-  const lifetimeRandom = random(seed + 11);
+  if (emission.lifetimeSeed !== seed) {
+    emission.lifetimeSeed = seed;
+    emission.lifetime = Math.max(0, evaluateNativeMinMaxCurve(initial.startLifetime, 0, random(seed + 11)));
+  }
+  const lifetime = emission.lifetime!;
+  const age = currentSimulationTime - (emission.motion?.birthTime ?? emission.simulationTime);
+  if (age < 0 || age >= lifetime) return undefined;
+  const normalized = clamp(age / lifetime);
   const sizeRandom = random(seed + 17);
-  const velocityRandom = random(seed + 23);
   const rotationRandom = random(seed + 29);
   const colorRandom = random(seed + 37);
-  const lifetime = Math.max(0, evaluateNativeMinMaxCurve(initial.startLifetime, 0, lifetimeRandom));
-  const age = currentSimulationTime - (emission.motion?.birthTime ?? emission.simulationTime);
-  if (lifetime <= 0 || age < 0 || age >= lifetime) return undefined;
-  const normalized = clamp(age / lifetime);
   if (!emission.motion) {
     shapePosition(
       system,
@@ -1871,7 +1869,7 @@ function sampleParticle(
       system,
       age,
       lifetime,
-      velocityRandom,
+      random(seed + 23),
       SHAPE_POSITION_SCRATCH,
       SHAPE_INITIAL_VELOCITY_SCRATCH,
       VELOCITY_POSITION_SCRATCH,
@@ -1903,10 +1901,11 @@ function sampleParticle(
   let sizeY = baseY;
   let sizeZ = baseZ;
   if (sizeModule?.enabled === true) {
-    sizeX *= evaluateNativeMinMaxCurve(sizeModule.curve, normalized, sizeRandom);
+    const scale = evaluateNativeMinMaxCurve(sizeModule.curve, normalized, sizeRandom);
     const separate = sizeModule.separateAxes === true;
-    sizeY *= evaluateNativeMinMaxCurve(separate ? sizeModule.y : sizeModule.curve, normalized, sizeRandom);
-    sizeZ *= evaluateNativeMinMaxCurve(separate ? sizeModule.z : sizeModule.curve, normalized, sizeRandom);
+    sizeX *= scale;
+    sizeY *= separate ? evaluateNativeMinMaxCurve(sizeModule.y, normalized, sizeRandom) : scale;
+    sizeZ *= separate ? evaluateNativeMinMaxCurve(sizeModule.z, normalized, sizeRandom) : scale;
   }
   const initialColor = evaluateNativeMinMaxGradient(
     initial.startColor,
@@ -2178,29 +2177,20 @@ function emissionEvents(
             ) ?? distanceRate,
           )
         : distanceRate;
-      // Unity 6000.3.12f1, matching libunity build ID 6b68c0ee...:
-      // Update1b derives emitter velocity with real delta time (0x132d274),
-      // then EmitOverDistance multiplies rate * |velocity| * scaled delta
-      // (0x12ddc5c). Therefore distance emission includes simulationSpeed.
-      // Animator motion is local; measure its distance after parent scaling.
-      const emittedDistanceCount =
-        Math.hypot(
-          (MOVEMENT_CURRENT_SCRATCH[0] - MOVEMENT_PREVIOUS_SCRATCH[0]) * distanceScaleX,
-          MOVEMENT_CURRENT_SCRATCH[1] - MOVEMENT_PREVIOUS_SCRATCH[1],
-          MOVEMENT_CURRENT_SCRATCH[2] - MOVEMENT_PREVIOUS_SCRATCH[2],
-        ) *
-        rate *
-        particleSystemSimulationSpeedAt(
-          system,
-          prefab.manifest,
-          judgementAnimation,
-          animationTimeOffset + currentTime,
-        );
-      const previousRemainder = distanceAccumulator;
-      distanceAccumulator += emittedDistanceCount;
       const previousTime = Math.max(0, currentTime - EMISSION_STEP);
       const previousSimulationTime =
         simulationClock?.timeAt(previousTime) ?? previousTime * system.simulationSpeed;
+      // The distance module consumes world-space travel. The simulation
+      // clock only determines the age of births along that travelled segment.
+      if (!system.looping && previousSimulationTime >= system.length) break;
+      const displacement = Math.hypot(
+        (MOVEMENT_CURRENT_SCRATCH[0] - MOVEMENT_PREVIOUS_SCRATCH[0]) * distanceScaleX,
+        MOVEMENT_CURRENT_SCRATCH[1] - MOVEMENT_PREVIOUS_SCRATCH[1],
+        MOVEMENT_CURRENT_SCRATCH[2] - MOVEMENT_PREVIOUS_SCRATCH[2],
+      );
+      const emittedDistanceCount = displacement * rate;
+      const previousRemainder = distanceAccumulator;
+      distanceAccumulator += emittedDistanceCount;
       let crossing = 1 - previousRemainder;
       while (distanceAccumulator >= 1) {
         // StartModules distributes births using emission spacing and the
@@ -3537,6 +3527,11 @@ export class ParticleLayer {
 
   private destroyImpact(impact: ImpactVisual): void {
     this.releaseImpactEmissionStates(impact);
+  }
+
+  get hasVisibleNoteEffects(): boolean {
+    return this.batchList.some((batch) => batch.count > 0) ||
+      this.impactBatchList.some((batch) => batch.count > 0);
   }
 
   get stats(): {

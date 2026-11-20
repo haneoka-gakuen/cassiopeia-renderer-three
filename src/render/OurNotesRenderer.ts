@@ -555,8 +555,12 @@ export class OurNotesRenderer implements NativeChartPresentation {
       // bucket; paused frames therefore preserve the finished effect image.
       this.particles.update(frame.particles);
       this.particleStateActive = true;
-      this.camera.updateMatrixWorld(true);
-      this.liveBloom.renderEffect(this.renderer, this.drawEffectScene);
+      if (this.nativeIntroActive || this.particles.hasVisibleNoteEffects || this.overlays.effectsCount > 0) {
+        this.camera.updateMatrixWorld(true);
+        this.liveBloom.renderEffect(this.renderer, this.drawEffectScene);
+      } else {
+        this.liveBloom.invalidate();
+      }
       this.effectCacheActive = true;
       this.lastEffectFrame = nativeEffectFrame;
     } else if (activeEffectAction === "release") {
