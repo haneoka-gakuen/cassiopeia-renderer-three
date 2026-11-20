@@ -140,6 +140,7 @@ interface ParticleEmission {
   index: number;
   shapeBirthWidth?: number;
   motion?: CachedParticleMotion;
+  animatedLifetime?: number;
   lifetimeSeed?: number;
   lifetime?: number;
 }
@@ -354,6 +355,8 @@ const ATTRIBUTE_SIZE_X = unityStringHash("m_Size.x");
 const ATTRIBUTE_ACTIVE = unityStringHash("m_IsActive");
 const ATTRIBUTE_TRANSFORM_POSITION = 1;
 const ATTRIBUTE_PARTICLE_SIMULATION_SPEED = unityStringHash("simulationSpeed");
+const ATTRIBUTE_PARTICLE_LIFETIME = unityStringHash("InitialModule.startLifetime.scalar");
+const ATTRIBUTE_PARTICLE_MIN_LIFETIME = unityStringHash("InitialModule.startLifetime.minScalar");
 const EMISSION_STEP = 1 / 60;
 // The source up-flick reaches 144 non-wall particles inside one Animator
 // window. This is a GPU allocation budget only: Unity's max-particle limit is
@@ -885,6 +888,15 @@ function particleSystemHasAnimatedSimulationSpeed(
     path !== undefined &&
     animation?.bindingLookup.get(path)?.has(ATTRIBUTE_PARTICLE_SIMULATION_SPEED) === true
   );
+}
+
+function particleSystemHasAnimatedStartLifetime(
+  system: LoadedParticleSystem,
+  animation: NativeAnimationClip | undefined,
+): boolean {
+  const path = system.animationPathHash;
+  const bindings = path === undefined ? undefined : animation?.bindingLookup.get(path);
+  return bindings?.has(ATTRIBUTE_PARTICLE_LIFETIME) === true || bindings?.has(ATTRIBUTE_PARTICLE_MIN_LIFETIME) === true;
 }
 
 function particleSimulationClock(
@@ -1830,6 +1842,16 @@ function applyAnimatedStartColor(
   }
 }
 
+function particleStartLifetime(system: LoadedParticleSystem, emission: ParticleEmission, seed: number): number {
+  if (emission.animatedLifetime !== undefined) return emission.animatedLifetime;
+  if (emission.lifetimeSeed !== seed) {
+    emission.lifetimeSeed = seed;
+    const initial = record(system.raw.InitialModule);
+    emission.lifetime = Math.max(0, evaluateNativeMinMaxCurve(initial?.startLifetime, 0, random(seed + 11)));
+  }
+  return emission.lifetime!;
+}
+
 function sampleParticle(
   system: LoadedParticleSystem,
   emission: ParticleEmission,
@@ -1846,11 +1868,7 @@ function sampleParticle(
   // Keep deterministic, independent channels for different particle modules.
   // Reusing one factor artificially ties large particles to short lifetimes
   // and slow velocities whenever the authored ranges run in opposite orders.
-  if (emission.lifetimeSeed !== seed) {
-    emission.lifetimeSeed = seed;
-    emission.lifetime = Math.max(0, evaluateNativeMinMaxCurve(initial.startLifetime, 0, random(seed + 11)));
-  }
-  const lifetime = emission.lifetime!;
+  const lifetime = particleStartLifetime(system, emission, seed);
   const age = currentSimulationTime - (emission.motion?.birthTime ?? emission.simulationTime);
   if (age < 0 || age >= lifetime) return undefined;
   const normalized = clamp(age / lifetime);
@@ -1985,6 +2003,7 @@ function appendEmission(
   originY: number,
   originZ: number,
   index: number,
+  animatedLifetime?: number,
 ): void {
   const emission = system.emissionPool.pop() ?? {
     simulationTime: 0,
@@ -2000,6 +2019,7 @@ function appendEmission(
   emission.index = index;
   emission.shapeBirthWidth = undefined;
   emission.motion = undefined;
+  emission.animatedLifetime = animatedLifetime;
   const result = system.emissionBuffer;
   const capacity = system.maxParticles;
   if (capacity <= 0) {
@@ -2104,6 +2124,39 @@ function emissionEvents(
   if (simulationDuration <= 0) return result;
   const emission = record(system.raw.EmissionModule);
   if (!emission || emission.enabled !== true) return result;
+  const lifetimeCurve = particleSystemHasAnimatedStartLifetime(system, judgementAnimation)
+    ? record(record(system.raw.InitialModule)?.startLifetime)
+    : undefined;
+  const animatedLifetimeAt = lifetimeCurve
+    ? (time: number, index: number) => {
+        const path = system.animationPathHash!;
+        const phase = animationPlaybackTime(prefab.manifest, judgementAnimation, animationTimeOffset + time);
+        const scalar = clipBindingValue(judgementAnimation, path, ATTRIBUTE_PARTICLE_LIFETIME, phase);
+        if (lifetimeCurve.minMaxState === 0) return Math.max(0, scalar ?? finite(lifetimeCurve.scalar));
+        const minScalar = clipBindingValue(judgementAnimation, path, ATTRIBUTE_PARTICLE_MIN_LIFETIME, phase);
+        const particleSeed = seed ^ Math.imul(index + 1, 0x9e3779b9);
+        return Math.max(0, evaluateNativeMinMaxCurve({
+          ...lifetimeCurve,
+          scalar: scalar ?? lifetimeCurve.scalar,
+          minScalar: minScalar ?? lifetimeCurve.minScalar,
+        }, 0, random(particleSeed + 11)));
+      }
+    : undefined;
+  const birthFrame = (simulationTime: number): number => {
+    // Animator properties are sampled once on the frame that emits the particle.
+    if (!simulationClock) {
+      const frame = Math.ceil((delay + simulationTime) / (system.simulationSpeed * EMISSION_STEP));
+      return Math.min(age, frame * EMISSION_STEP);
+    }
+    let low = 0;
+    let high = Math.ceil(realDuration / EMISSION_STEP);
+    while (low < high) {
+      const middle = (low + high) >>> 1;
+      if (simulationClock.timeAt(Math.min(realDuration, middle * EMISSION_STEP)) < simulationTime) low = middle + 1;
+      else high = middle;
+    }
+    return Math.min(realDuration, low * EMISSION_STEP);
+  };
   let emissionIndex = 0;
   const cycleCount =
     system.looping && system.length > 0 ? Math.floor(simulationDuration / system.length) + 1 : 1;
@@ -2122,7 +2175,11 @@ function emissionEvents(
           0,
           Math.round(evaluateNativeMinMaxCurve(burst.countCurve, 0, random(seed + emissionIndex + 59))),
         );
-        for (let index = 0; index < count; index += 1) appendEmission(system, time, 0, 0, 0, emissionIndex++);
+        const frame = animatedLifetimeAt ? birthFrame(time) : 0;
+        for (let index = 0; index < count; index += 1) {
+          appendEmission(system, time, 0, 0, 0, emissionIndex, animatedLifetimeAt?.(frame, emissionIndex));
+          emissionIndex++;
+        }
       }
     }
   }
@@ -2138,7 +2195,8 @@ function emissionEvents(
     const rate = Math.max(0, evaluateNativeMinMaxCurve(emission.rateOverTime, normalized, random(seed + 61)));
     accumulator += rate * step;
     while (accumulator >= 1) {
-      appendEmission(system, sampleTime, 0, 0, 0, emissionIndex++);
+      appendEmission(system, sampleTime, 0, 0, 0, emissionIndex, animatedLifetimeAt?.(birthFrame(sampleTime), emissionIndex));
+      emissionIndex++;
       accumulator -= 1;
     }
   }
@@ -2209,8 +2267,10 @@ function emissionEvents(
           lerp(MOVEMENT_PREVIOUS_SCRATCH[0], MOVEMENT_CURRENT_SCRATCH[0], fraction),
           lerp(MOVEMENT_PREVIOUS_SCRATCH[1], MOVEMENT_CURRENT_SCRATCH[1], fraction),
           lerp(MOVEMENT_PREVIOUS_SCRATCH[2], MOVEMENT_CURRENT_SCRATCH[2], fraction),
-          emissionIndex++,
+          emissionIndex,
+          animatedLifetimeAt?.(currentTime, emissionIndex),
         );
+        emissionIndex++;
         distanceAccumulator -= 1;
         crossing += 1;
       }
@@ -2295,6 +2355,7 @@ function appendRateEmission(
   emission.index = index;
   emission.shapeBirthWidth = undefined;
   emission.motion = undefined;
+  emission.animatedLifetime = undefined;
 }
 
 function emissionRingAt(ring: EmissionRing, index: number): ParticleEmission {
@@ -3372,15 +3433,14 @@ export class ParticleLayer {
         state.pool.push(motion);
       }
     const initial = record(system.raw.InitialModule)!;
+    let maximumAnimatedLifetime = 0;
     for (const emission of emissions) {
       emission.motion = undefined;
+      maximumAnimatedLifetime = Math.max(maximumAnimatedLifetime, emission.animatedLifetime ?? 0);
       let motion = state.particles.get(emission.index);
       if (!motion) {
         const particleSeed = seed ^ Math.imul(emission.index + 1, 0x9e3779b9);
-        const lifetime = Math.max(
-          0,
-          evaluateNativeMinMaxCurve(initial.startLifetime, 0, random(particleSeed + 11)),
-        );
+        const lifetime = particleStartLifetime(system, emission, particleSeed);
         const age = simulationTime - emission.simulationTime;
         if (lifetime <= 0 || age < 0 || age >= lifetime) continue;
         shapePosition(
@@ -3432,7 +3492,7 @@ export class ParticleLayer {
         state.particles.delete(index);
         state.pool.push(motion);
       }
-    state.clock.endFrame();
+    state.clock.endFrame(maximumAnimatedLifetime);
   }
 
   private emissionEventsFor(
@@ -3449,6 +3509,7 @@ export class ParticleLayer {
     if (
       !this.incrementalEmissions ||
       (system.ref.animationPath && (!prefab.manifest.loopAnimation || animationTimeOffset !== 0)) ||
+      particleSystemHasAnimatedStartLifetime(system, judgementAnimation) ||
       simulationClock ||
       !supportsIncrementalRateEmission(system, seed)
     ) {
