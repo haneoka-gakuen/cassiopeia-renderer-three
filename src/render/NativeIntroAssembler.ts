@@ -155,14 +155,28 @@ export class NativeIntroAssembly {
           const id = transform(component), c = colour(component.data.m_Color), size = object(component.data.m_Size);
           const go = index.resolve(component.data.m_GameObject, component), layer = finite(go.data.m_Layer);
           if (layer !== 25 && layer !== 29) throw new Error("Unsupported intro sprite pass");
+          const sortingLayerId = finite(component.data.m_SortingLayerID);
+          const sortingLayer = finite(component.data.m_SortingLayer);
+          if (
+            !((sortingLayer === 0 && sortingLayerId === 0) ||
+              (layer === 29 && sortingLayer === 1 && sortingLayerId === -1080380835))
+          ) throw new Error(`Unsupported original intro Sprite sorting layer: ${sortingLayerId}/${sortingLayer}`);
+          const drawMode = finite(component.data.m_DrawMode);
+          if (drawMode !== 0 && drawMode !== 1 && drawMode !== 2)
+            throw new Error(`Unsupported original intro Sprite draw mode: ${drawMode}`);
+          if (drawMode === 2) {
+            const pivot = object(sprite.data.m_Pivot);
+            if (component.data.m_SpriteTileMode !== 0 || pivot.x !== 0.5 || pivot.y !== 0.5)
+              throw new Error("Unsupported original intro Sprite tiling policy");
+          }
           const material = await materialFor(component, image, c);
           spriteColours.set(id, c);
           // Select the nearest authored SortingGroup by ancestry depth, retaining prefab order.
           const nearest = sortingGroupFor(id);
           spriteSpecs.push({ transformId: id, sprite: parseNativeIntroSprite(sprite, image.width, image.height),
-            drawMode: finite(component.data.m_DrawMode) as 0 | 1, size: [finite(size.x), finite(size.y)],
+            drawMode, size: [finite(size.x), finite(size.y)],
             flipX: component.data.m_FlipX === true, flipY: component.data.m_FlipY === true, layer,
-            sortingLayerId: finite(component.data.m_SortingLayerID) as 0, sortingOrder: finite(component.data.m_SortingOrder),
+            sortingLayer, sortingOrder: finite(component.data.m_SortingOrder),
             sortingGroup: nearest, material,
             setColour: next => (material.uniforms.uVertexColour!.value as Vector4).set(...next) });
         } else if (component.type === "SkinnedMeshRenderer" && component.data.m_Enabled === true) {

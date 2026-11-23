@@ -259,6 +259,8 @@ export class ScreenLaneBackdrop {
   private texture?: Texture;
   private backgroundTexture?: Texture;
   private requestedOpacity = 1;
+  private backgroundCoverWidth = 1920;
+  private backgroundCoverHeight = 1080;
   private introBackgroundScaleX = 1;
   private introBackgroundScaleY = 1;
   private logicalWidth = 1920;
@@ -362,11 +364,6 @@ export class ScreenLaneBackdrop {
     this.backgroundBaseMesh.position.set(logicalWidth / 2, logicalHeight / 2, -3);
     this.backgroundBaseMesh.scale.set(logicalWidth, logicalHeight, 1);
     this.backgroundMesh.position.set(logicalWidth / 2, logicalHeight / 2, -2);
-    this.backgroundMesh.scale.set(
-      logicalWidth * this.introBackgroundScaleX,
-      logicalHeight * this.introBackgroundScaleY,
-      1,
-    );
     this.backgroundShadowMesh.position.set(logicalWidth / 2, logicalHeight / 2, -1);
     this.backgroundShadowMesh.scale.set(logicalWidth, logicalHeight, 1);
     this.updateBackgroundCover();
@@ -384,7 +381,7 @@ export class ScreenLaneBackdrop {
     if (![x, y].every(Number.isFinite) || x < 0 || y < 0) throw new Error("Invalid intro background scale");
     this.introBackgroundScaleX = x;
     this.introBackgroundScaleY = y;
-    this.backgroundMesh.scale.set(this.logicalWidth * x, this.logicalHeight * y, 1);
+    this.updateBackgroundScale();
   }
 
   setBackgroundTexture(texture?: Texture): void {
@@ -407,18 +404,28 @@ export class ScreenLaneBackdrop {
   }
 
   private updateBackgroundCover(): void {
-    const texture = this.backgroundTexture;
-    if (!texture) return;
-    const image = texture.image as
+    const image = this.backgroundTexture?.image as
       | { width?: number; height?: number; videoWidth?: number; videoHeight?: number }
       | undefined;
     const imageWidth = Number(image?.videoWidth || image?.width);
     const imageHeight = Number(image?.videoHeight || image?.height);
-    if (!(imageWidth > 0) || !(imageHeight > 0)) return;
-    const cover = backgroundCoverUv(imageWidth, imageHeight, this.logicalWidth, this.logicalHeight);
-    texture.offset.set(cover.offsetX, cover.offsetY);
-    texture.repeat.set(cover.repeatX, cover.repeatY);
-    texture.updateMatrix();
+    this.backgroundCoverWidth = this.logicalWidth;
+    this.backgroundCoverHeight = this.logicalHeight;
+    if (imageWidth > 0 && imageHeight > 0) {
+      const cover = backgroundCoverUv(imageWidth, imageHeight, this.logicalWidth, this.logicalHeight);
+      this.backgroundCoverWidth /= cover.repeatX;
+      this.backgroundCoverHeight /= cover.repeatY;
+    }
+    this.updateBackgroundScale();
+  }
+
+  private updateBackgroundScale(): void {
+    // AspectRatioFitter sizes the full RawImage. The intro then scales that RectTransform.
+    this.backgroundMesh.scale.set(
+      this.backgroundCoverWidth * this.introBackgroundScaleX,
+      this.backgroundCoverHeight * this.introBackgroundScaleY,
+      1,
+    );
   }
 
   dispose(): void {

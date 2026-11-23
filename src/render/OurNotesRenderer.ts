@@ -512,7 +512,20 @@ export class OurNotesRenderer implements NativeChartPresentation {
   }
 
   setNativeIntroBackgroundScale(scale: readonly [number, number, number]): void {
-    this.screenLane.setBackgroundScale(scale[0], scale[1]);
+    this.introBackgroundScale = scale;
+    if (!this.performanceBackground) this.screenLane.setBackgroundScale(scale[0], scale[1]);
+  }
+
+  private introBackgroundScale: readonly [number, number, number] = [1, 1, 1];
+  private performanceBackground?: Texture;
+
+  /** The host owns the stage render target and its texture. */
+  setPerformanceBackground(texture?: Texture): void {
+    if (texture === this.performanceBackground) return;
+    this.performanceBackground = texture;
+    this.screenLane.setBackgroundTexture(texture ?? this.backgroundTexture);
+    const [scaleX, scaleY] = texture ? ([1, 1] as const) : this.introBackgroundScale;
+    this.screenLane.setBackgroundScale(scaleX, scaleY);
   }
 
   render(frame: RenderFrame): void {
@@ -799,7 +812,7 @@ export class OurNotesRenderer implements NativeChartPresentation {
       this.uploadedBackgroundCanvasVersion = undefined;
       this.backgroundTexture?.dispose();
       this.backgroundTexture = undefined;
-      this.screenLane.setBackgroundTexture(undefined);
+      this.screenLane.setBackgroundTexture(this.performanceBackground);
       return;
     }
     // Do not clear the current stage while the replacement is in flight. A
@@ -820,7 +833,7 @@ export class OurNotesRenderer implements NativeChartPresentation {
     this.backgroundCanvasVersion = undefined;
     this.uploadedBackgroundCanvasVersion = undefined;
     this.backgroundTexture = texture;
-    this.screenLane.setBackgroundTexture(texture);
+    this.screenLane.setBackgroundTexture(this.performanceBackground ?? texture);
     previous?.dispose();
   }
 
@@ -836,7 +849,7 @@ export class OurNotesRenderer implements NativeChartPresentation {
     this.uploadedBackgroundCanvasVersion = undefined;
     if (!video) {
       this.backgroundTexture = undefined;
-      this.screenLane.setBackgroundTexture(undefined);
+      this.screenLane.setBackgroundTexture(this.performanceBackground);
       previous?.dispose();
       return;
     }
@@ -844,7 +857,7 @@ export class OurNotesRenderer implements NativeChartPresentation {
     this.configureGammaTexture(texture);
     texture.generateMipmaps = false;
     this.backgroundTexture = texture;
-    this.screenLane.setBackgroundTexture(texture);
+    this.screenLane.setBackgroundTexture(this.performanceBackground ?? texture);
     previous?.dispose();
   }
 
@@ -865,7 +878,7 @@ export class OurNotesRenderer implements NativeChartPresentation {
       this.backgroundCanvasVersion = undefined;
       this.uploadedBackgroundCanvasVersion = undefined;
       this.backgroundTexture = undefined;
-      this.screenLane.setBackgroundTexture(undefined);
+      this.screenLane.setBackgroundTexture(this.performanceBackground);
       previous?.dispose();
       return;
     }
@@ -878,7 +891,7 @@ export class OurNotesRenderer implements NativeChartPresentation {
     this.backgroundCanvasVersion = Number.isFinite(version) ? version : undefined;
     this.uploadedBackgroundCanvasVersion = this.backgroundCanvasVersion;
     this.backgroundTexture = texture;
-    this.screenLane.setBackgroundTexture(texture);
+    this.screenLane.setBackgroundTexture(this.performanceBackground ?? texture);
     previous?.dispose();
   }
 
